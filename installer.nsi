@@ -99,7 +99,7 @@ Section "!VM-Harness Application" SEC01
   SetOverwrite ifnewer
 
   ; Main executable
-  File "dist\VM-Harness.exe"
+  File /r "dist\VM-Harness\*.*"
 
   ; Icon for shortcuts
   File "vm-harness.ico"
