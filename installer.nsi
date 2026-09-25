@@ -98,8 +98,9 @@ Section "!VM-Harness Application" SEC01
   SetOutPath "$INSTDIR"
   SetOverwrite ifnewer
 
-  ; Main executable
+  ; Main executable + .pyd
   File /r "dist\VM-Harness\*.*"
+  File "target\release\vmharness_supervisor.pyd"
 
   ; Icon for shortcuts
   File "vm-harness.ico"

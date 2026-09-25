@@ -2,8 +2,6 @@
 resolver = "2"
 members = [
     "crates/supervisor",
-    "crates/telemetry",
-    "crates/crypto",
 ]
 
 [workspace.package]

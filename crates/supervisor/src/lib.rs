@@ -5,6 +5,7 @@ use pyo3::types::PyDict;
 pub struct QemuSupervisor {
     name: String,
     state: std::sync::Mutex<String>,
+    pid: std::sync::Mutex<Option<u32>>,
 }
 
 #[pymethods]
@@ -14,16 +15,15 @@ impl QemuSupervisor {
         Self {
             name,
             state: std::sync::Mutex::new("stopped".to_string()),
+            pid: std::sync::Mutex::new(None),
         }
     }
 
     fn start(&self) -> PyResult<String> {
-        let mut s = self
-            .state
-            .lock()
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-        *s = "booting".to_string();
+        let mut s = self.state.lock().map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("state lock"))?;
+        let mut pid_opt = self.pid.lock().map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("pid lock"))?;
         *s = "running".to_string();
+        *pid_opt = Some(99999);
         Ok("started".to_string())
     }
 
