@@ -1,0 +1,17 @@
+{
+  "name": "vmharness-web",
+  "version": "2.0.0",
+  "description": "VM-Harness web UI — compiled with Google Closure Compiler + TypeScript",
+  "scripts": {
+    "build": "webpack --mode production",
+    "build:closure": "python ../tools/build_web.py",
+    "dev": "webpack serve --mode development",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "typescript": "~5.4",
+    "webpack": "^5.90",
+    "ts-loader": "^9.5"
+  }
+}

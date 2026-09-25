@@ -545,8 +545,12 @@ class MainWindow(QMainWindow):
 
     def _tray_activated(self, reason):
         """Handle tray icon activation — only restore on double-click."""
+        # Explicitly ignore all activation reasons except DoubleClick
+        # On Windows, setContextMenu() can cause single-click to emit Trigger
         if reason == QSystemTrayIcon.DoubleClick:
             self._restore_from_tray()
+        # All other reasons (Trigger, MiddleClick, Context, Unknown) → ignore
+        # Do NOT call any action for single-click
 
     def _quit_from_tray(self):
         """Quit from tray — properly clean up."""
