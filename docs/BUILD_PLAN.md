@@ -1275,4 +1275,117 @@ The build is "flawless" when:
 
 ---
 
+## 16. WINDOWS / WHPX / QEMU CONFIGURATION NOTES
+
+### 16.1 WHPX Acceleration (Windows)
+
+On Windows, QEMU uses the Windows Hypervisor Platform (WHPX) accelerator:
+
+```
+-accel whpx,kernel-irqchip=off
+```
+
+**Known limitation**: WHPX does not support `-cpu host` (host CPU passthrough).
+The QEMU build must use `-cpu qemu64` instead, which works without KVM/HVF.
+
+```python
+# In gui/multi_vm.py _build_qemu_args():
+"-accel", "whpx,kernel-irqchip=off" if os.name == "nt" else "tcg",
+"-cpu", "qemu64",  # NOT "host" — WHPX doesn't support host CPU model
+```
+
+### 16.2 Guest Agent (Windows Named Pipes)
+
+The QEMU guest agent chardev for Windows (`//./pipe/qga-{name}`) can fail
+with "Failed to bind socket: Unknown error" on some Windows builds due to
+named-pipe namespace conflicts.
+
+**Workaround**: Omit the guest agent chardev from QEMU launch args. The VM
+will still function — guest agent features (file transfer, commands) simply
+won't be available until a working named-pipe configuration is found.
+
+```python
+# In gui/multi_vm.py _build_qemu_args():
+# Guest agent chardev removed — causes named-pipe bind errors on some Windows builds
+# if os.name == "nt":
+#     args.extend(["-chardev", ...])
+#     args.extend(["-device", ...])
+```
+
+### 16.3 Display Mode (Windows QEMU Build)
+
+This QEMU build supports these display backends:
+
+```
+none, gtk, sdl, egl-headless, curses, spice-app, dbus
+```
+
+**Not supported**: `-display spice` (only `spice-app` is available).
+**Not supported**: `-vga virtio` combined with `-display none` (causes exit code 1).
+
+**Headless server mode**: Use `-display none` with `-vga none`:
+
+```
+-vga none -display none
+```
+
+This launches QEMU in headless mode with QMP control only — no graphical
+output. VM metrics are streamed via QMP (`/v1/proto` endpoint) and the GUI
+web bridge (`web/dist/index.html` via QWebChannel).
+
+**VNC mode** (for actual VM screen in GUI):
+
+```
+-vga virtio -vnc :0 -display none
+```
+
+Then connect a VNC viewer to `127.0.0.1:5900`. Can be embedded in PyQt5
+GUI using a VNC client widget or HTML VNC viewer in QWebEngineView.
+
+**SPICE mode** (alternative):
+
+```
+-display spice-app
+```
+
+Requires SPICE client (e.g., `spice-gtk` or remote viewer).
+
+### 16.4 EFI Flash Files
+
+QEMU requires UEFI firmware for x86_64 VMs. Files are in the QEMU share directory:
+
+```
+C:/Program Files/qemu/share/edk2-x86_64-code.fd       (readonly, code)
+C:/Program Files/qemu/share/edk2-x86_64-secure-code.fd (readonly, secure boot)
+```
+
+The vars file (`edk2-x86_64-vars.fd`) is NOT included in this QEMU build.
+Copy from another source or use `-drive if=pflash,format=raw,readonly=on,file=...`
+with only the code file (VM will boot but may show UEFI variable warnings).
+
+For VM-Harness, the vars file is copied to `~/.qemu-mcp/edk2-x86_64-vars.fd`
+on first use.
+
+### 16.5 QMP Port Allocation
+
+QMP ports are allocated starting from `DEFAULT_QMP_PORT_BASE = 4444`.
+Each VM gets a unique QMP port. The server manages port allocation to avoid
+conflicts. QMP is used for:
+- VM lifecycle control (start/stop/reset/pause/resume/powerdown)
+- Metrics streaming (CPU, memory, disk, network stats)
+- Console/serial access
+
+### 16.6 Known Issues & Workarounds
+
+| Issue | Cause | Workaround |
+|-------|-------|------------|
+| QEMU exits with "invalid accelerator kvm" | KVM not available on this machine | Use WHPX (`-accel whpx,kernel-irqchip=off`) |
+| QEMU exits with "CPU model 'host' requires KVM or HVF" | WHPX doesn't support host CPU | Use `-cpu qemu64` |
+| QEMU exits with "Parameter 'type' does not accept value 'spice'" | Build only has `spice-app` not `spice` | Use `-display none` or `-display spice-app` |
+| Guest agent chardev fails to bind | Windows named-pipe namespace conflict | Omit guest agent chardev from launch args |
+| `-vga virtio -display none` causes exit 1 | QEMU build limitation | Use `-vga none -display none` |
+| No `edk2-x86_64-vars.fd` in QEMU share | Not included in this build | Copy from elsewhere or omit (VM boots with warnings) |
+
+---
+
 *End of plan. Every component specified. Every test defined. Every dependency pinned. Implementation can begin immediately from Phase 1, Step 1.*

@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VM-Harness — QWebChannel Bridge</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: #0d1117;
+    color: #c9d1d9;
+    min-height: 100vh;
+    padding: 24px;
+  }
+  .container { max-width: 960px; margin: 0 auto; }
+  h1 { font-size: 20px; margin-bottom: 16px; color: #58a6ff; }
+  .card {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    padding: 16px;
+    margin-bottom: 12px;
+  }
+  .card h2 { font-size: 14px; margin-bottom: 12px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; }
+  .row { display: flex; gap: 8px; margin-bottom: 8px; }
+  .btn {
+    background: #238636;
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 8px 16px;
+    font-size: 13px;
+    cursor: pointer;
+    font-weight: 500;
+  }
+  .btn:hover { background: #2ea043; }
+  .btn.danger { background: #da3633; }
+  .btn.danger:hover { background: #f85149; }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .metric {
+    display: flex;
+    justify-content: space-between;
+    padding: 4px 0;
+    border-bottom: 1px solid #21262d;
+    font-size: 13px;
+  }
+  .metric:last-child { border-bottom: none; }
+  .metric .label { color: #8b949e; }
+  .metric .value { color: #f0f6fc; font-weight: 500; font-variant-numeric: tabular-nums; }
+  .status-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    border-radius: 6px;
+    font-size: 13px;
+    margin-bottom: 12px;
+  }
+  .status-bar.running { background: #0d5320; color: #7ee787; }
+  .status-bar.stopped { background: #3d1f1f; color: #ff7b72; }
+  .status-bar.booting { background: #1f3d1f; color: #d29922; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+  .log {
+    background: #0d1117;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    padding: 8px;
+    font-family: 'Consolas', 'Monaco', monospace;
+    font-size: 12px;
+    max-height: 200px;
+    overflow-y: auto;
+    color: #8b949e;
+    line-height: 1.5;
+  }
+  .log .entry { padding: 2px 0; }
+  .log .entry.error { color: #f85149; }
+  .log .entry.success { color: #7ee787; }
+  .log .entry.info { color: #58a6ff; }
+  .version { font-size: 11px; color: #484f58; text-align: right; margin-top: 16px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>VM-Harness — QWebChannel Bridge</h1>
+
+  <div id="statusBar" class="status-bar stopped">
+    <span class="dot"></span>
+    <span id="statusText">Disconnected</span>
+  </div>
+
+  <div class="card">
+    <h2>VM Control</h2>
+    <div class="row">
+      <button class="btn" id="btnStart" onclick="window.VmHarnessBridge && window.VmHarnessBridge.startVm('test-vm')">Start VM</button>
+      <button class="btn danger" id="btnStop" onclick="window.VmHarnessBridge && window.VmHarnessBridge.stopVm('test-vm')" disabled>Stop VM</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>VM Metrics</h2>
+    <div id="metrics">
+      <div class="metric"><span class="label">Status</span><span class="value" id="mStatus">—</span></div>
+      <div class="metric"><span class="label">CPU</span><span class="value" id="mCpu">—</span></div>
+      <div class="metric"><span class="label">Memory</span><span class="value" id="mMem">—</span></div>
+      <div class="metric"><span class="label">Uptime</span><span class="value" id="mUptime">—</span></div>
+      <div class="metric"><span class="label">Disk Read</span><span class="value" id="mDiskR">—</span></div>
+      <div class="metric"><span class="label">Disk Write</span><span class="value" id="mDiskW">—</span></div>
+      <div class="metric"><span class="label">Network RX</span><span class="value" id="mNetRX">—</span></div>
+      <div class="metric"><span class="label">Network TX</span><span class="value" id="mNetTX">—</span></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Bridge Log</h2>
+    <div class="log" id="log">
+      <div class="entry info">Waiting for QWebChannel...</div>
+    </div>
+  </div>
+
+  <div class="version">VM-Harness Web Bridge v2.0.0 | Protocol 3.0.0</div>
+</div>
+
+<script>
+(function() {
+  var logEl = document.getElementById('log');
+  var statusBar = document.getElementById('statusBar');
+  var statusText = document.getElementById('statusText');
+
+  function log(msg, cls) {
+    var div = document.createElement('div');
+    div.className = 'entry' + (cls ? ' ' + cls : '');
+    div.textContent = msg;
+    logEl.appendChild(div);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function setStatus(state) {
+    statusBar.className = 'status-bar ' + state;
+    var dot = statusBar.querySelector('.dot');
+    statusText.textContent = state.charAt(0).toUpperCase() + state.slice(1);
+  }
+
+  function updateMetrics(metrics) {
+    if (!metrics) return;
+    document.getElementById('mStatus').textContent = metrics.cpu_percent + '%' || '—';
+    document.getElementById('mCpu').textContent = (metrics.cpu_percent || 0).toFixed(1) + '%';
+    document.getElementById('mMem').textContent = (metrics.memory_used_mb || 0) + ' / ' + (metrics.memory_total_mb || 0) + ' MB';
+    document.getElementById('mUptime').textContent = (metrics.uptime_seconds || 0) + 's';
+    document.getElementById('mDiskR').textContent = formatBytes(metrics.disk_read_bytes || 0);
+    document.getElementById('mDiskW').textContent = formatBytes(metrics.disk_write_bytes || 0);
+    document.getElementById('mNetRX').textContent = formatBytes(metrics.net_rx_bytes || 0);
+    document.getElementById('mNetTX').textContent = formatBytes(metrics.net_tx_bytes || 0);
+
+    var st = metrics.cpu_percent > 0 ? 'running' : 'stopped';
+    setStatus(st);
+  }
+
+  function formatBytes(b) {
+    if (b === 0) return '0 B';
+    var units = ['B','KB','MB','GB'];
+    var i = 0;
+    while (b >= 1024 && i < units.length - 1) { b /= 1024; i++; }
+    return b.toFixed(1) + ' ' + units[i];
+  }
+
+  // Connect to QWebChannel
+  if (typeof QWebChannel !== 'undefined') {
+    log('QWebChannel available, connecting...', 'info');
+    new QWebChannel(qt.webChannelTransport, function(channel) {
+      log('QWebChannel connected', 'success');
+      window.VmHarnessBridge = channel.objects.VmHarnessBridge;
+      log('VmHarnessBridge object acquired', 'success');
+
+      // Update button states
+      document.getElementById('btnStart').disabled = false;
+      document.getElementById('btnStop').disabled = true;
+
+      // Poll metrics every 2s
+      setInterval(function() {
+        if (window.VmHarnessBridge) {
+          try {
+            var state = window.VmHarnessBridge.getVmState('test-vm');
+            if (state && state.state) {
+              updateMetrics(state);
+              log('Metrics updated: ' + state.state, '');
+            }
+          } catch(e) {
+            log('Metrics error: ' + e.message, 'error');
+          }
+        }
+      }, 2000);
+    });
+  } else {
+    log('QWebChannel not available — running in standalone browser', 'info');
+    // Standalone mode: simulate for testing
+    setInterval(function() {
+      updateMetrics({
+        cpu_percent: Math.random() * 5,
+        memory_used_mb: 128 + Math.random() * 64,
+        memory_total_mb: 512,
+        uptime_seconds: Math.floor(Math.random() * 100),
+        disk_read_bytes: Math.floor(Math.random() * 1024 * 1024),
+        disk_write_bytes: Math.floor(Math.random() * 512 * 1024),
+        net_rx_bytes: Math.floor(Math.random() * 1024 * 1024 * 10),
+        net_tx_bytes: Math.floor(Math.random() * 512 * 1024 * 10)
+      });
+      if (document.getElementById('mStatus').textContent === '—') {
+        setStatus('running');
+        document.getElementById('mStatus').textContent = 'running (simulated)';
+      }
+    }, 2000);
+    log('Running in standalone mode (no QWebChannel)', 'info');
+  }
+})();
+</script>
+</body>
+</html>

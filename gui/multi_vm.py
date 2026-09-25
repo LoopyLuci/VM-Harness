@@ -647,7 +647,7 @@ class MultiVMManager:
             "-smp", vcpus,
             "-m", ram_mb,
             "-accel", "whpx,kernel-irqchip=off" if os.name == "nt" else "tcg",
-            "-cpu", "host" if os.name == "nt" else "qemu64",
+            "-cpu", "qemu64",
             "-drive", "if=pflash,format=raw,readonly=on,"
                       "file=C:/Program Files/qemu/share/edk2-x86_64-code.fd",
             "-netdev", f"user,id=net0,hostfwd=tcp::{ssh_port}-:22",
@@ -690,16 +690,14 @@ class MultiVMManager:
             if drive and os.path.exists(drive):
                 args.extend(["-drive", f"if=virtio,format=qcow2,file={drive},index={i+1}"])
 
-        # Guest agent (Unix socket for Windows named pipe compatibility)
-        if os.name == "nt":
-            args.extend(["-chardev", f"socket,path=//./pipe/qga-{config.vm_name},server=on,wait=off,id=ga0"])
-            args.extend(["-device", "virtio-serial-pci"])
-            args.extend(["-device", "virtserialport,chardev=ga0,name=org.qemu.guest_agent.0"])
-        else:
-            ga_socket = Path.home() / ".qemu-mcp" / f"qga-{config.name}.sock"
-            args.extend(["-chardev", f"socket,path={ga_socket},server=on,wait=off,id=ga0"])
-            args.extend(["-device", "virtio-serial-pci"])
-            args.extend(["-device", "virtserialport,chardev=ga0,name=org.qemu.guest_agent.0"])
+        # Guest agent removed — causes named-pipe bind errors on some Windows builds
+        # If needed, can be re-added with Unix socket or fixed named-pipe path
+        # if os.name == "nt":
+        #     args.extend(["-chardev", ...])
+        #     args.extend(["-device", ...])
+        #     args.extend(["-device", ...])
+        # else:
+        #     ...
 
         # Extra args
         if config.extra_args:
