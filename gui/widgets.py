@@ -644,65 +644,87 @@ class TelemetryChart(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        self.figure = __import__("matplotlib.figure").figure.Figure(
-            figsize=(4, 2.5), dpi=100)
-        self.canvas = __import__(
-            "matplotlib.backends.backend_qtagg",
-            fromlist=["FigureCanvasQTAgg"]).FigureCanvasQTAgg(self.figure)
-        layout.addWidget(self.canvas)
-
-        self._ax = self.figure.add_subplot(111)
-        self._ax.set_facecolor(T.BG_PRIMARY)
-        self._ax.set_title(title, color=T.TEXT_SECONDARY,
-                            fontsize=10, pad=8)
-        self._ax.tick_params(colors=T.TEXT_MUTED, labelsize=8)
-        self._ax.spines["bottom"].set_color(T.BG_TERTIARY)
-        self._ax.spines["left"].set_color(T.BG_TERTIARY)
-        self._ax.spines["top"].set_visible(False)
-        self._ax.spines["right"].set_visible(False)
-        self._ax.set_ylabel(value_label, color=T.TEXT_MUTED, fontsize=8)
-        self._ax.grid(True, alpha=0.2, color=T.BG_TERTIARY)
-        self._line, = self._ax.plot([], [], color=self._color,
-                                     linewidth=1.5)
-        self._ax.set_xlim(0, self._max_points)
-        self._ax.set_ylim(0, 100)
+        try:
+            self.figure = __import__("matplotlib.figure").figure.Figure(
+                figsize=(4, 2.5), dpi=100)
+            self.canvas = __import__(
+                "matplotlib.backends.backend_qtagg",
+                fromlist=["FigureCanvasQTAgg"]).FigureCanvasQTAgg(self.figure)
+            layout.addWidget(self.canvas)
+            self._ax = self.figure.add_subplot(111)
+            self._ax.set_facecolor(T.BG_PRIMARY)
+            self._ax.set_title(title, color=T.TEXT_SECONDARY,
+                                fontsize=10, pad=8)
+            self._ax.tick_params(colors=T.TEXT_MUTED, labelsize=8)
+            self._ax.spines["bottom"].set_color(T.BG_TERTIARY)
+            self._ax.spines["left"].set_color(T.BG_TERTIARY)
+            self._ax.spines["top"].set_visible(False)
+            self._ax.spines["right"].set_visible(False)
+            self._ax.set_ylabel(value_label, color=T.TEXT_MUTED, fontsize=8)
+            self._ax.grid(True, alpha=0.2, color=T.BG_TERTIARY)
+            self._line, = self._ax.plot([], [], color=self._color,
+                                         linewidth=1.5)
+            self._ax.set_xlim(0, self._max_points)
+            self._ax.set_ylim(0, 100)
+            self._matplotlib_available = True
+        except Exception as e:
+            # Graceful fallback when matplotlib is not available
+            # (e.g., frozen PyInstaller build missing matplotlib bundle)
+            import logging
+            logging.getLogger("vmharness.gui").warning(
+                "matplotlib unavailable (%s) — using placeholder chart", e)
+            self._matplotlib_available = False
+            placeholder = QWidget(self)
+            placeholder.setLayout(QVBoxLayout())
+            label = QLabel(
+                f"Telemetry chart unavailable\n({value_label})\n"
+                "(matplotlib missing from frozen build)"
+            )
+            label.setAlignment(Qt.AlignCenter)
+            label.setStyleSheet("color: #64748b; font-size: 10px;")
+            placeholder.layout().addWidget(label)
+            layout.addWidget(placeholder)
 
         self.setLayout(layout)
 
     def update_data(self, value: float):
-        self._data.append(value)
-        if len(self._data) > self._max_points:
-            self._data = self._data[-self._max_points:]
-        xs = list(range(len(self._data)))
-        self._line.set_data(xs, self._data)
-        if len(self._data) > 1:
-            self._ax.set_xlim(0, len(self._data) - 1)
-            lo = min(self._data) * 0.8
-            hi = max(self._data) * 1.1
-            if lo == hi:
-                lo, hi = 0, 1
-            self._ax.set_ylim(lo, hi)
-        self.canvas.draw_idle()
+        if getattr(self, '_matplotlib_available', True):
+            self._data.append(value)
+            if len(self._data) > self._max_points:
+                self._data = self._data[-self._max_points:]
+            xs = list(range(len(self._data)))
+            self._line.set_data(xs, self._data)
+            if len(self._data) > 1:
+                self._ax.set_xlim(0, len(self._data) - 1)
+                lo = min(self._data) * 0.8
+                hi = max(self._data) * 1.1
+                if lo == hi:
+                    lo, hi = 0, 1
+                self._ax.set_ylim(lo, hi)
+            self.canvas.draw_idle()
 
     def clear(self):
-        self._data = []
-        self._line.set_data([], [])
-        self.canvas.draw_idle()
+        if getattr(self, '_matplotlib_available', True):
+            self._data = []
+            self._line.set_data([], [])
+            self.canvas.draw_idle()
 
     def set_color(self, color: str):
-        self._color = color
-        self._line.set_color(color)
-        self.canvas.draw_idle()
+        if getattr(self, '_matplotlib_available', True):
+            self._color = color
+            self._line.set_color(color)
+            self.canvas.draw_idle()
 
     def get_ydata(self) -> List[float]:
         return list(self._data)
 
     def export_to_png(self, path: str):
         """Export the current chart to a PNG file."""
-        self.figure.savefig(path, dpi=150,
-                            facecolor=T.BG_PRIMARY,
-                            edgecolor='none',
-                            bbox_inches='tight')
+        if getattr(self, '_matplotlib_available', True):
+            self.figure.savefig(path, dpi=150,
+                                facecolor=T.BG_PRIMARY,
+                                edgecolor='none',
+                                bbox_inches='tight')
 
 
 # -- Log Entry Widget -------------------------------------------------------------

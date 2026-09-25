@@ -367,6 +367,13 @@ class MainWindow(QMainWindow):
         self.title_bar = TitleBar(self)
         main_layout.addWidget(self.title_bar)
 
+        # Wire web bridge for TypeScript/Web UI integration (QWebChannel)
+        try:
+            from gui.web_bridge import WebBridgeEngine
+            self.web_engine = WebBridgeEngine()
+        except Exception:
+            pass
+
         # Main content area
         content = QWidget()
         content_layout = QHBoxLayout(content)
