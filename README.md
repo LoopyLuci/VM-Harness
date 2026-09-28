@@ -1,13 +1,26 @@
-# VM-Harness — Complete QEMU Virtual Machine Control Suite
+# VM-Harness
 
-Control QEMU virtual machines through a PyQt5 desktop GUI, CLI, REST API, or MCP server.
+Control virtual machines and containers from one place: a desktop window, a local API, an MCP server for AI agents,
+and a command line. QEMU, VirtualBox, VMware, Hyper-V, WSL and KVM; Docker, Podman, Kubernetes and Compose.
+
+## Quick start
+
+```bash
+pip install -e ".[dev]"
+python -m vm_harness gui           # the window
+python -m vm_harness mcp           # MCP server for Claude Desktop, ABP, Cursor... (stdio)
+python -m vm_harness call vm.list  # any operation from the command line
+```
+
+Everything goes through one local service, the hub: see **[docs/control.md](docs/control.md)** for the API, the 160+
+operations, MCP, and driving the window remotely.
 
 ## Features
 
-- **23 GUI Panels** — Complete VM control from a polished dark-themed desktop interface
+- **34 GUI Panels** — Complete VM control from a polished dark-themed desktop interface
 - **CLI Tool** — Command-line interface for scripting and agent access
 - **REST API** — HTTP endpoints for programmatic control
-- **MCP Server** — AI agent tools via Model Context Protocol
+- **MCP Server** — every operation as an MCP tool, including driving the window (`python -m vm_harness mcp`)
 - **Self-Healing** — Atomic state, process guardian, automatic recovery
 - **Multi-VM** — Control multiple QEMU instances from one interface
 - **ISO Manager** — Internal storage + external folder scanning + downloads

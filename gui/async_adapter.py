@@ -11,6 +11,8 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import time
 import threading
 from typing import Any
 
@@ -45,6 +47,7 @@ class AsyncAdapter:
         self._qemu = None
         self._vmware = None
         self._vbox = None
+        self._failures: dict = {}
         self._start_loop()
 
     def _start_loop(self):
@@ -53,18 +56,39 @@ class AsyncAdapter:
         self._thread = threading.Thread(target=self._loop.run_forever, daemon=True)
         self._thread.start()
 
-    def _run_async(self, coro, timeout: float = 30):
+    def _run_async(self, coro, timeout: float = 15):
         """Run a coroutine in the background event loop and return the result."""
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return future.result(timeout=timeout)
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            raise TimeoutError(f"backend call did not finish within {timeout:.0f}s")
+
+    # A backend that failed to connect is not tried again for a while: the panels poll on timers, and retrying a
+    # dead Docker daemon or Kubernetes cluster on every tick froze the window.
+    RETRY_AFTER_S = 30.0
+
+    def _connect(self, attr: str, make, connect_name: str = "connect"):
+        failed_at, error = self._failures.get(attr, (0.0, None))
+        if error is not None and time.monotonic() - failed_at < self.RETRY_AFTER_S:
+            raise RuntimeError(f"{attr} unavailable (retrying in {self.RETRY_AFTER_S - (time.monotonic() - failed_at):.0f}s): {error}")
+        backend = make()
+        try:
+            self._run_async(getattr(backend, connect_name)())
+        except Exception as e:
+            self._failures[attr] = (time.monotonic(), e)
+            raise
+        self._failures.pop(attr, None)
+        setattr(self, attr, backend)
+        return backend
 
     @property
     def docker(self) -> "_DockerAdapter":
         """Get Docker adapter."""
         if self._docker is None:
             from vm_harness.container.docker.backend import DockerBackend
-            self._docker = DockerBackend()
-            self._run_async(self._docker.connect())
+            self._connect("_docker", DockerBackend, "connect")
         return _DockerAdapter(self._docker, self._run_async)
 
     @property
@@ -72,8 +96,7 @@ class AsyncAdapter:
         """Get Kubernetes adapter."""
         if self._kubernetes is None:
             from vm_harness.container.kubernetes.backend import KubernetesBackend
-            self._kubernetes = KubernetesBackend()
-            self._run_async(self._kubernetes.connect())
+            self._connect("_kubernetes", KubernetesBackend, "connect")
         return _KubernetesAdapter(self._kubernetes, self._run_async)
 
     @property
@@ -81,8 +104,7 @@ class AsyncAdapter:
         """Get Podman adapter."""
         if self._podman is None:
             from vm_harness.container.podman.backend import PodmanBackend
-            self._podman = PodmanBackend()
-            self._run_async(self._podman.connect())
+            self._connect("_podman", PodmanBackend, "connect")
         return _PodmanAdapter(self._podman, self._run_async)
 
     @property
@@ -90,8 +112,7 @@ class AsyncAdapter:
         """Get QEMU adapter."""
         if self._qemu is None:
             from vm_harness.hypervisor.qemu.backend import QEMUBackend
-            self._qemu = QEMUBackend()
-            self._run_async(self._qemu.initialize())
+            self._connect("_qemu", QEMUBackend, "initialize")
         return _QEMUAdapter(self._qemu, self._run_async)
 
     @property
@@ -99,8 +120,7 @@ class AsyncAdapter:
         """Get VMware adapter."""
         if self._vmware is None:
             from vm_harness.hypervisor.vmware.backend import VMwareBackend
-            self._vmware = VMwareBackend()
-            self._run_async(self._vmware.connect())
+            self._connect("_vmware", VMwareBackend, "initialize")
         return _VMwareAdapter(self._vmware, self._run_async)
 
     @property
@@ -108,8 +128,7 @@ class AsyncAdapter:
         """Get VirtualBox adapter."""
         if self._vbox is None:
             from vm_harness.hypervisor.virtualbox.backend import VirtualBoxBackend
-            self._vbox = VirtualBoxBackend()
-            self._run_async(self._vbox.connect())
+            self._connect("_vbox", VirtualBoxBackend, "initialize")
         return _VirtualBoxAdapter(self._vbox, self._run_async)
 
 

@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
+
+from vm_harness import _proc
 # Suppress CLI console windows on Windows
 CREATE_NO_WINDOW = 0x08000000
 from typing import Any, List, Optional, Union
@@ -40,7 +42,7 @@ class PodmanBackend(ContainerBackend):
     async def connect(self) -> None:
         """Verify podman is available."""
         try:
-            result = subprocess.run(
+            result = await _proc.run(
                 ["podman", "--version"],
                 capture_output=True, text=True, timeout=5,
             )
@@ -59,10 +61,10 @@ class PodmanBackend(ContainerBackend):
         """Check if podman is available."""
         return self._connected
 
-    def _run_podman(self, args: list, timeout: int = 30) -> str:
-        """Run a podman command and return stdout."""
+    async def _run_podman(self, args: list, timeout: int = 30) -> str:
+        """Run a podman command off the event loop and return stdout."""
         try:
-            result = subprocess.run(
+            result = await _proc.run(
                 ["podman"] + args,
                 capture_output=True, text=True, timeout=timeout,
             )
@@ -79,7 +81,7 @@ class PodmanBackend(ContainerBackend):
         args = ["ps", "--format", "json"]
         if all:
             args.insert(1, "--all")
-        output = self._run_podman(args)
+        output = await self._run_podman(args)
         if not output:
             return []
         try:
@@ -100,7 +102,7 @@ class PodmanBackend(ContainerBackend):
 
     async def get_container(self, container_id: str) -> Any:
         """Get container details."""
-        output = self._run_podman(["inspect", "--format", "json", container_id])
+        output = await self._run_podman(["inspect", "--format", "json", container_id])
         if not output:
             return None
         try:
@@ -131,20 +133,20 @@ class PodmanBackend(ContainerBackend):
                 args.extend(config.command)
             else:
                 args.extend(["/bin/sh", "-c", config.command])
-        output = self._run_podman(args)
+        output = await self._run_podman(args)
         return {"id": output, "name": config.name}
 
     async def start_container(self, container_id: str) -> None:
         """Start a container."""
-        self._run_podman(["start", container_id])
+        await self._run_podman(["start", container_id])
 
     async def stop_container(self, container_id: str, timeout: int = 10) -> None:
         """Stop a container."""
-        self._run_podman(["stop", "--time", str(timeout), container_id])
+        await self._run_podman(["stop", "--time", str(timeout), container_id])
 
     async def restart_container(self, container_id: str, timeout: int = 10) -> None:
         """Restart a container."""
-        self._run_podman(["restart", "--time", str(timeout), container_id])
+        await self._run_podman(["restart", "--time", str(timeout), container_id])
 
     async def remove_container(
         self, container_id: str, force: bool = False, volumes: bool = False
@@ -156,7 +158,7 @@ class PodmanBackend(ContainerBackend):
         if volumes:
             args.append("--volumes")
         args.append(container_id)
-        self._run_podman(args)
+        await self._run_podman(args)
 
     async def exec_command(
         self, container_id: str, command: Union[str, List[str]], tty: bool = False, timeout: int | None = None
@@ -169,17 +171,17 @@ class PodmanBackend(ContainerBackend):
             args.extend([container_id] + command)
         else:
             args.extend([container_id, "/bin/sh", "-c", command])
-        output = self._run_podman(args, timeout=timeout or 30)
+        output = await self._run_podman(args, timeout=timeout or 30)
         return CommandResult(exit_code=0, output=output, stderr="")
 
     async def get_logs(self, container_id: str, tail: int = 100, **kwargs: Any) -> str:
         """Get container logs."""
-        output = self._run_podman(["logs", "--tail", str(tail), container_id])
+        output = await self._run_podman(["logs", "--tail", str(tail), container_id])
         return output
 
     async def get_stats(self, container_id: str) -> ContainerStats:
         """Get container stats."""
-        output = self._run_podman(["stats", "--no-stream", "--format", "json", container_id])
+        output = await self._run_podman(["stats", "--no-stream", "--format", "json", container_id])
         try:
             data = json.loads(output)
             if isinstance(data, list) and data:
@@ -204,7 +206,7 @@ class PodmanBackend(ContainerBackend):
 
     async def list_images(self) -> List[ContainerImage]:
         """List images."""
-        output = self._run_podman(["images", "--format", "json"])
+        output = await self._run_podman(["images", "--format", "json"])
         if not output:
             return []
         try:
@@ -223,7 +225,7 @@ class PodmanBackend(ContainerBackend):
 
     async def pull_image(self, image: str, tag: str = "latest") -> None:
         """Pull an image."""
-        self._run_podman(["pull", f"{image}:{tag}"], timeout=300)
+        await self._run_podman(["pull", f"{image}:{tag}"], timeout=300)
 
     async def remove_image(self, image_id: str, force: bool = False) -> None:
         """Remove an image."""
@@ -231,11 +233,11 @@ class PodmanBackend(ContainerBackend):
         if force:
             args.append("--force")
         args.append(image_id)
-        self._run_podman(args)
+        await self._run_podman(args)
 
     async def list_networks(self) -> List[ContainerNetwork]:
         """List networks."""
-        output = self._run_podman(["network", "ls", "--format", "json"])
+        output = await self._run_podman(["network", "ls", "--format", "json"])
         if not output:
             return []
         try:
@@ -259,12 +261,12 @@ class PodmanBackend(ContainerBackend):
         if internal:
             args.append("--internal")
         args.append(name)
-        self._run_podman(args)
+        await self._run_podman(args)
         return ContainerNetwork(id=name, name=name, driver=driver)
 
     async def list_volumes(self) -> List[ContainerVolume]:
         """List volumes."""
-        output = self._run_podman(["volume", "ls", "--format", "json"])
+        output = await self._run_podman(["volume", "ls", "--format", "json"])
         if not output:
             return []
         try:
@@ -288,5 +290,5 @@ class PodmanBackend(ContainerBackend):
         for key, val in (labels or {}).items():
             args.extend(["--label", f"{key}={val}"])
         args.append(name)
-        self._run_podman(args)
+        await self._run_podman(args)
         return ContainerVolume(name=name, driver=driver, mountpoint="")

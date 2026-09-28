@@ -35,7 +35,6 @@ from gui.panels_usb import (
     load_usb_config,
     save_usb_config,
     _parse_device_id,
-    _sample_devices,
     _CONFIG_FILE,
 )
 
@@ -202,13 +201,6 @@ class TestWMIHelpers:
         result = enumerate_usb_devices_wmi()
         assert isinstance(result, list)
 
-    def test_sample_devices_returns_four(self):
-        devices = _sample_devices()
-        assert len(devices) == 4
-        assert all(isinstance(d, USBDevice) for d in devices)
-        # Spot-check
-        vids = [d.vendor_id for d in devices]
-        assert "046d" in vids
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

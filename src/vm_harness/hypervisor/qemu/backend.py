@@ -24,6 +24,9 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
+
+from vm_harness import _proc
 import time
 from datetime import datetime
 from pathlib import Path
@@ -65,6 +68,101 @@ DEFAULT_VNC_PORT_BASE = 5900
 DEFAULT_VMS_DIR = str(Path.home() / ".qemu-mcp" / "vms")
 
 
+def find_qemu(tool: str) -> str | None:
+    """A QEMU program: $VMH_QEMU_DIR, PATH, then the usual install places (installer, Scoop, Chocolatey, MSYS2)."""
+    exe = tool + (".exe" if os.name == "nt" else "")
+    dirs = [os.environ.get("VMH_QEMU_DIR", ""), r"C:\Program Files\qemu", r"%USERPROFILE%\scoop\apps\qemu\current",
+            r"%ProgramData%\chocolatey\lib\qemu\tools", r"C:\msys64\ucrt64\bin", r"C:\msys64\mingw64\bin",
+            "/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"]
+    return _proc.find_tool([tool], [Path(os.path.expandvars(d)) / exe for d in dirs if d])
+
+
+def _firmware(name: str, qemu_binary: str) -> str | None:
+    """An EDK2 firmware file shipped with QEMU (next to the binary, or in share/)."""
+    base = Path(qemu_binary).resolve().parent
+    for d in (base / "share", base, base.parent / "share" / "qemu", Path("/usr/share/qemu"), Path("/usr/share/OVMF")):
+        if (d / name).is_file():
+            return str(d / name)
+    return None
+
+
+class _RunningVM:
+    """A VM's QEMU process, found again from its run file after this process (or the service) restarts.
+
+    Quacks like the ``subprocess.Popen`` the backend used to keep in memory (``pid``, ``poll``, ``kill``), but is
+    tied to the process by pid *and* creation time, so a reused pid is never mistaken for the VM."""
+
+    def __init__(self, pid: int, created: float, run_file: Path) -> None:
+        self.pid, self.created, self.run_file = pid, created, run_file
+
+    def _process(self):
+        import psutil
+        try:
+            p = psutil.Process(self.pid)
+            return p if abs(p.create_time() - self.created) < 2 and p.status() != psutil.STATUS_ZOMBIE else None
+        except psutil.Error:
+            return None
+
+    def poll(self) -> int | None:
+        return None if self._process() else 0
+
+    def kill(self) -> None:
+        p = self._process()
+        if p:
+            p.kill()
+
+
+class _ProcessTable:
+    """name -> _RunningVM, kept in ``<vms_dir>/<name>/run.json`` so every VM-Harness process sees the same VMs."""
+
+    def __init__(self, vms_dir: Path) -> None:
+        self._dir = vms_dir
+
+    def _file(self, name: str) -> Path:
+        return self._dir / name / "run.json"
+
+    def get(self, name: str) -> _RunningVM | None:
+        f = self._file(name)
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        vm = _RunningVM(int(data["pid"]), float(data["created"]), f)
+        if vm.poll() is not None:
+            f.unlink(missing_ok=True)
+            return None
+        return vm
+
+    def info(self, name: str) -> dict:
+        try:
+            return json.loads(self._file(name).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+
+    def __contains__(self, name: str) -> bool:
+        return self.get(name) is not None
+
+    def __getitem__(self, name: str) -> _RunningVM:
+        vm = self.get(name)
+        if vm is None:
+            raise KeyError(name)
+        return vm
+
+    def __setitem__(self, name: str, proc: Any) -> None:
+        import psutil
+        f = self._file(name)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        data = {"pid": proc.pid, "created": psutil.Process(proc.pid).create_time(),
+                "started_at": datetime.now().isoformat(), **getattr(proc, "vmh_extra", {})}
+        f.write_text(json.dumps(data), encoding="utf-8")
+
+    def __delitem__(self, name: str) -> None:
+        self._file(name).unlink(missing_ok=True)
+
+    def keys(self) -> list[str]:
+        return [p.parent.name for p in self._dir.glob("*/run.json") if p.parent.name in self]
+
+
 # ── Helper: find next free port ────────────────────────────────────────────────
 
 def _find_free_port(base: int, max_tries: int = 100) -> int:
@@ -100,8 +198,8 @@ class QEMUBackend(HypervisorBackend):
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         super().__init__(config)
-        self._qemu_binary = self._config.get("qemu_binary", DEFAULT_QEMU_BINARY)
-        self._qemu_img = self._config.get("qemu_img", DEFAULT_QEMU_IMG)
+        self._qemu_binary = self._config.get("qemu_binary") or find_qemu("qemu-system-x86_64") or DEFAULT_QEMU_BINARY
+        self._qemu_img = self._config.get("qemu_img") or find_qemu("qemu-img") or DEFAULT_QEMU_IMG
         self._vms_dir = Path(self._config.get("vms_dir", DEFAULT_VMS_DIR))
         self._vms_dir.mkdir(parents=True, exist_ok=True)
         self._qmp_port_base = self._config.get("qmp_port_base", DEFAULT_QMP_PORT_BASE)
@@ -111,7 +209,7 @@ class QEMUBackend(HypervisorBackend):
         self._default_disk_format = self._config.get("default_disk_format", "qcow2")
 
         # Runtime state
-        self._processes: dict[str, subprocess.Popen] = {}
+        self._processes = _ProcessTable(self._vms_dir)
         self._qmp_clients: dict[str, Any] = {}  # QMPClient instances
         self._next_qmp_port = self._qmp_port_base
         self._next_spice_port = self._spice_port_base
@@ -313,13 +411,20 @@ class QEMUBackend(HypervisorBackend):
         args = self._build_qemu_args(config, headless)
 
         try:
-            proc = subprocess.Popen(
-                args,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
-            )
+            vm_dir = self._vms_dir / name
+            vm_dir.mkdir(parents=True, exist_ok=True)
+            log_path = vm_dir / "qemu.log"
+            with open(log_path, "wb") as log_file:
+                # Detached: the VM outlives whichever VM-Harness process started it. Output goes to a file (a pipe
+                # nobody reads would fill and freeze QEMU).
+                flags = (subprocess.CREATE_NEW_PROCESS_GROUP | _proc.CREATE_NO_WINDOW) if os.name == "nt" else 0
+                proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=log_file, stderr=subprocess.STDOUT,
+                                        creationflags=flags, start_new_session=os.name != "nt")
+            await asyncio.sleep(0.5)
+            if proc.poll() is not None:
+                raise HypervisorError(log_path.read_text(encoding="utf-8", errors="replace").strip()[-800:]
+                                      or f"QEMU exited {proc.returncode}")
+            proc.vmh_extra = {"log": str(log_path), "args": args}
             self._processes[name] = proc
             logger.info("Started QEMU VM '%s' (PID: %d)", name, proc.pid)
 
@@ -345,24 +450,22 @@ class QEMUBackend(HypervisorBackend):
                 if client and client.is_connected:
                     await client.send("system_powerdown")
                     # Wait for process to exit
-                    proc = self._processes[name]
-                    try:
-                        proc.wait(timeout=15)
-                        del self._processes[name]
-                        await self._disconnect_qmp(name)
-                        return
-                    except subprocess.TimeoutExpired:
-                        pass
+                    for _ in range(60):
+                        if name not in self._processes:
+                            await self._disconnect_qmp(name)
+                            return
+                        await asyncio.sleep(0.5)
             except Exception as e:
                 logger.debug("Graceful shutdown failed for '%s': %s", name, e)
 
         # Force kill
-        proc = self._processes[name]
-        proc.kill()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            pass
+        proc = self._processes.get(name)
+        if proc is not None:
+            proc.kill()
+            for _ in range(20):
+                if proc.poll() is not None:
+                    break
+                await asyncio.sleep(0.25)
         del self._processes[name]
         await self._disconnect_qmp(name)
         logger.info("Stopped QEMU VM '%s'", name)
@@ -405,15 +508,12 @@ class QEMUBackend(HypervisorBackend):
         config = await self._load_vm_config(name)
         status = VMStatus(name=name, backend_name=self.default_name)
 
-        if name in self._processes:
-            proc = self._processes[name]
-            if proc.poll() is None:
-                status.state = VMState.RUNNING
-                status.pid = proc.pid
-                status.started_at = datetime.now().isoformat()
-            else:
-                status.state = VMState.STOPPED
-                del self._processes[name]
+        proc = self._processes.get(name)
+        if proc is not None:
+            status.state = VMState.RUNNING
+            status.pid = proc.pid
+            status.started_at = self._processes.info(name).get("started_at", "")
+            status.uptime_seconds = int(time.time() - proc.created)
         else:
             status.state = VMState.STOPPED
 
@@ -536,13 +636,19 @@ class QEMUBackend(HypervisorBackend):
     async def screenshot(self, name: str) -> bytes:
         """Capture a screenshot from the VM display."""
         client = await self._require_qmp_client(name)
-        result = await client.send("screendump", {"device": "VGA", "filename": "/tmp/screenshot.png"})
-        # Read the screenshot file
+        # QEMU writes the file itself, so the path must be one QEMU can reach: the VM's own folder on this host.
+        out = self._vms_dir / name / "screenshot.png"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.unlink(missing_ok=True)
+        await client.send("screendump", {"filename": str(out), "format": "png"})
+        for _ in range(20):
+            if out.exists() and out.stat().st_size > 0:
+                break
+            await asyncio.sleep(0.1)
         try:
-            with open("/tmp/screenshot.png", "rb") as f:
-                return f.read()
-        except FileNotFoundError:
-            return b""
+            return out.read_bytes()
+        finally:
+            out.unlink(missing_ok=True)
 
     # ── Console / Terminal ───────────────────────────────────────────────────
 
@@ -721,7 +827,7 @@ class QEMUBackend(HypervisorBackend):
             raise VMAlreadyRunningError("Cannot resize disk while VM is running")
 
         if self._qemu_img:
-            subprocess.run(
+            await _proc.run(
                 [self._qemu_img, "resize", disk_path, f"{new_size_gb}G"],
                 check=True, capture_output=True, text=True
             )
@@ -791,7 +897,7 @@ class QEMUBackend(HypervisorBackend):
             raise VMAlreadyRunningError("Cannot export while VM is running")
 
         if self._qemu_img:
-            subprocess.run(
+            await _proc.run(
                 [self._qemu_img, "convert", "-f", config.get("disk_format", "qcow2"),
                  "-O", format, disk_path, output_path],
                 check=True, capture_output=True, text=True
@@ -838,7 +944,7 @@ class QEMUBackend(HypervisorBackend):
         if src_disk and dst_disk:
             if linked:
                 if self._qemu_img:
-                    subprocess.run(
+                    await _proc.run(
                         [self._qemu_img, "create", "-f", "qcow2", "-b", src_disk,
                          "-F", config.get("disk_format", "qcow2"), dst_disk],
                         check=True, capture_output=True, text=True
@@ -907,24 +1013,31 @@ class QEMUBackend(HypervisorBackend):
         args.extend(["-machine", machine_type])
         args.extend(["-smp", vcpus])
         args.extend(["-m", ram_mb])
-        cpu_model = config.get("cpu_model", "") or ("host" if os.name == "nt" else "qemu64")
-        args.extend(["-cpu", cpu_model])
+        # "host"/"max" crash under WHPX ("Unexpected VP exit code 4" on this Windows 10 host); QEMU's default model
+        # runs everywhere. KVM on Linux takes "host" for full speed.
+        cpu_model = config.get("cpu_model", "") or (
+            "host" if sys.platform.startswith("linux") and config.get("enable_kvm", True) else "")
+        if cpu_model:
+            args.extend(["-cpu", cpu_model])
         args.extend(["-name", name])
         args.extend(["-qmp", f"tcp:127.0.0.1:{qmp_port},server,nowait"])
 
-        # Acceleration
+        # Acceleration: the hardware accelerator if it works, else QEMU falls back to TCG (slower, always there).
         if config.get("enable_kvm", True):
             if os.name == "nt":
                 args.extend(["-accel", "whpx,kernel-irqchip=off"])
+            elif sys.platform == "darwin":
+                args.extend(["-accel", "hvf"])
             else:
                 args.extend(["-accel", "kvm"])
+        args.extend(["-accel", "tcg"])
 
         # Firmware
         if config.get("boot_firmware", "bios") == "uefi":
-            args.extend([
-                "-drive", "if=pflash,format=raw,readonly=on,"
-                          "file=C:/Program Files/qemu/share/edk2-x86_64-code.fd"
-            ])
+            fw = _firmware("edk2-x86_64-code.fd", self._qemu_binary) or _firmware("OVMF_CODE.fd", self._qemu_binary)
+            if not fw:
+                raise HypervisorError("UEFI firmware (edk2-x86_64-code.fd) not found next to QEMU")
+            args.extend(["-drive", f"if=pflash,format=raw,readonly=on,file={fw}"])
 
         # Network
         net_mode = config.get("network_mode", "nat")
@@ -1011,7 +1124,7 @@ class QEMUBackend(HypervisorBackend):
     async def _create_disk(self, path: str, size_gb: int, format: str) -> None:
         """Create a disk image using qemu-img."""
         if self._qemu_img:
-            subprocess.run(
+            await _proc.run(
                 [self._qemu_img, "create", "-f", format, path, f"{size_gb}G"],
                 check=True, capture_output=True, text=True
             )

@@ -62,6 +62,10 @@ class TestContainerStatsPanel(unittest.TestCase):
         """Instantiate the panel (patch already active from setUp)."""
         from gui.panels_container_stats import ContainerStatsPanel
         panel = ContainerStatsPanel()
+        # Panels load their data when shown (a hidden panel does not poll its backends).
+        panel.show()
+        from PyQt5.QtWidgets import QApplication
+        QApplication.processEvents()
         return panel
 
     # ── Test 1: Panel constructs and table has correct structure ───────────

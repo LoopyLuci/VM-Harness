@@ -199,6 +199,7 @@ class Sidebar(QWidget):
         ("Security", "🔒", "security"),
         ("Automation", "🤖", "automation"),
         ("Troubleshoot", "🔍", "troubleshoot"),
+        ("Logs", "📜", "logs"),
         ("AI Chat", "💬", "chat"),
         ("AI Providers", "🤖", "providers"),
         ("Pairing", "🔗", "pairing"),
@@ -488,6 +489,7 @@ class MainWindow(QMainWindow):
 
     def _setup_system_tray(self):
         """Set up system tray icon. Fails gracefully in headless/offscreen environments."""
+        self.tray_icon = None
         try:
             if not QSystemTrayIcon.isSystemTrayAvailable():
                 import logging
@@ -552,8 +554,25 @@ class MainWindow(QMainWindow):
         # All other reasons (Trigger, MiddleClick, Context, Unknown) → ignore
         # Do NOT call any action for single-click
 
+    def attach_hub(self, start_hub: bool = True):
+        """Attach to the VM-Harness hub so the API, the MCP server and ABP can drive this window (gui.* operations).
+        Started by the launcher, not by the constructor, so tests that build windows never start a hub."""
+        from gui.automation import HubLink
+        if getattr(self, "hub_link", None) is not None:
+            return self.hub_link
+        self._hub_label = QLabel("Hub: connecting")
+        self._hub_label.setStyleSheet("color: #64748b; padding: 0 8px;")
+        self.status_bar.addPermanentWidget(self._hub_label)
+        self.hub_link = HubLink(self, start_hub=start_hub)
+        self.hub_link.attached.connect(
+            lambda ok: self._hub_label.setText("Hub: attached" if ok else "Hub: reconnecting"))
+        self.hub_link.start()
+        return self.hub_link
+
     def _quit_from_tray(self):
         """Quit from tray — properly clean up."""
+        if getattr(self, "hub_link", None) is not None:
+            self.hub_link.stop()
         self._save_state()
         if self.tray_icon:
             self.tray_icon.hide()

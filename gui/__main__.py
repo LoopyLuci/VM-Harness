@@ -9,6 +9,7 @@ import atexit
 import logging
 import argparse
 import time
+from pathlib import Path
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Debug logging — use fixed absolute path
@@ -166,6 +167,11 @@ def main():
         os.environ["QT_QPA_PLATFORM"] = args.platform
     elif args.headless:
         os.environ["QT_QPA_PLATFORM"] = "offscreen"
+    if os.environ.get("QT_QPA_PLATFORM") == "offscreen" and not os.environ.get("QT_QPA_FONTDIR"):
+        # The offscreen platform ships no fonts: without this, screenshots of a headless window have no text.
+        fonts = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" if os.name == "nt" else Path("/usr/share/fonts")
+        if fonts.is_dir():
+            os.environ["QT_QPA_FONTDIR"] = str(fonts)
     if args.dev:
         os.environ["VM_HARNESS_DEV"] = "1"
 
@@ -189,6 +195,8 @@ def main():
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
+    if os.environ.get("VMH_NO_HUB") != "1":
+        window.attach_hub()
     
     try:
         exit_code = app.exec_()

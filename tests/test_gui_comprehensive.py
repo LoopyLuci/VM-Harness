@@ -88,20 +88,46 @@ def main_window(app, request):
 
 @pytest.fixture
 def qmp_client():
-    """Create a QMP client connected to live QEMU."""
-    from vm_harness.setup import QMPClient
-    
-    # Create new event loop for this test
+    """A QMP client connected to a real, throwaway QEMU (no disk, no display) started for the test."""
+    import socket
+    import subprocess
+    import time as _time
+    from vm_harness.hypervisor.qemu.backend import find_qemu
+    from vm_harness.qmp_client import QMPClient
+
+    qemu = find_qemu("qemu-system-x86_64")
+    if not qemu:
+        pytest.skip("QEMU is not installed")
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    proc = subprocess.Popen([qemu, "-machine", "q35", "-m", "128", "-display", "none", "-accel", "tcg",
+                             "-name", "qmp-test", "-qmp", f"tcp:127.0.0.1:{port},server,nowait"],
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    
+
     async def _connect():
-        client = QMPClient("tcp:127.0.0.1:4444")
-        await client.connect()
-        return client
-    
-    client = loop.run_until_complete(_connect())
+        deadline = _time.time() + 20
+        while True:
+            try:
+                client = QMPClient(f"tcp:127.0.0.1:{port}")
+                await client.connect()
+                return client
+            except OSError:
+                if _time.time() > deadline:
+                    raise
+                await asyncio.sleep(0.2)
+
+    try:
+        client = loop.run_until_complete(_connect())
+    except Exception:
+        proc.kill()
+        raise
+    client.test_loop = loop
     yield client
+    proc_to_kill = proc
     
     async def _disconnect():
         await client.disconnect()
@@ -112,6 +138,7 @@ def qmp_client():
         pass
     finally:
         loop.close()
+        proc_to_kill.kill()
 
 
 # ── Test Category 1: Panel Initialization ──────────────────────────────────
@@ -120,19 +147,18 @@ class TestPanelInitialization:
     """Test that all panels load correctly."""
 
     def test_all_panels_instantiate(self, main_window):
-        """All 23 panels should instantiate without error."""
-        assert len(main_window.panels) == 25
+        """Every panel is built (plugins may add more)."""
+        from gui.main_window import Sidebar
+        assert len(main_window.panels) >= len(Sidebar.PANELS)
 
     def test_panel_names_match_expected(self, main_window):
-        """Panel names should match sidebar entries."""
-        expected = {
-            "dashboard", "vm_switcher", "vm_control", "guest_terminal",
-            "guest_agent", "telemetry", "qmp_console", "sysinfo",
-            "snapshots", "wizard", "storage", "cpu", "display", "qemu",
-            "usb", "network", "automation", "troubleshoot", "monitoring",
-            "settings", "security", "logs", "iso", "chat", "providers"
-        }
-        assert set(main_window.panels.keys()) == expected
+        """Every panel can be reached from the sidebar, and every sidebar entry opens a panel."""
+        from gui.main_window import Sidebar
+        sidebar = {name for _label, _icon, name in Sidebar.PANELS}
+        assert sidebar <= set(main_window.panels)
+        # Anything else is a plugin's panel (plugins/*.py), which adds its own button.
+        plugin_panels = set(main_window.panels) - sidebar
+        assert all("-" in n or n.startswith("plugin") for n in plugin_panels), plugin_panels
 
     def test_sidebar_panel_count_matches(self, main_window):
         """Sidebar PANELS count should match actual panels."""
@@ -162,59 +188,49 @@ class TestQMPBridge:
 
     def test_query_status(self, qmp_client):
         """query-status should return valid data."""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        loop = qmp_client.test_loop  # the loop the client connected on
         result = loop.run_until_complete(
             qmp_client.send("query-status")
         )
         assert "return" in result
-        loop.close()
 
     def test_query_name(self, qmp_client):
         """query-name should return VM name."""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        loop = qmp_client.test_loop  # the loop the client connected on
         result = loop.run_until_complete(
             qmp_client.send("query-name")
         )
         assert "return" in result
         # Name may be empty if VM not fully started
         assert isinstance(result["return"], dict)
-        loop.close()
 
     def test_query_uuid(self, qmp_client):
         """query-uuid should return UUID."""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        loop = qmp_client.test_loop  # the loop the client connected on
         result = loop.run_until_complete(
             qmp_client.send("query-uuid")
         )
         assert "return" in result
         # UUID may be empty if VM not fully started
         assert isinstance(result["return"], dict)
-        loop.close()
 
     def test_query_version(self, qmp_client):
         """query-version should return version info."""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        loop = qmp_client.test_loop  # the loop the client connected on
         result = loop.run_until_complete(
             qmp_client.send("query-version")
         )
         assert "return" in result
-        loop.close()
 
     def test_query_kvm(self, qmp_client):
         """query-kvm should return KVM status."""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        loop = qmp_client.test_loop  # the loop the client connected on
         result = loop.run_until_complete(
             qmp_client.send("query-kvm")
         )
         assert "return" in result
         # enabled field may not be present if KVM not active
         assert isinstance(result["return"], dict)
-        loop.close()
 
     def test_bridge_signals_exist(self, main_window):
         """QMP bridge should have all required signals."""

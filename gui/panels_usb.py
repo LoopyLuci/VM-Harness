@@ -309,48 +309,6 @@ def save_usb_config(config: Dict[str, Any], path: str = None) -> bool:
 # Sample fallback devices (used when WMI is unavailable)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _sample_devices() -> List[USBDevice]:
-    """Return a list of sample USB devices for UI preview."""
-    return [
-        USBDevice(
-            vendor_id="046d",
-            product_id="c52b",
-            serial="12345678",
-            bus="001",
-            device="003",
-            vendor_name="Logitech",
-            product_name="Unifying Receiver",
-        ),
-        USBDevice(
-            vendor_id="0781",
-            product_id="5567",
-            serial="ABC123",
-            bus="002",
-            device="001",
-            vendor_name="SanDisk",
-            product_name="Ultra USB 3.0",
-        ),
-        USBDevice(
-            vendor_id="05ac",
-            product_id="12a8",
-            serial="iPhone",
-            bus="001",
-            device="005",
-            vendor_name="Apple",
-            product_name="iPhone",
-        ),
-        USBDevice(
-            vendor_id="0483",
-            product_id="5740",
-            serial="STLink-001",
-            bus="003",
-            device="002",
-            vendor_name="STMicroelectronics",
-            product_name="ST-Link V2",
-        ),
-    ]
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # Main Panel
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -624,9 +582,9 @@ class USBDevicePanel(QWidget):
         """Re-enumerate USB devices and repopulate the table."""
         devices = enumerate_usb_devices_wmi()
         if not devices:
-            devices = _sample_devices()
+            # Never show made-up devices: an agent (or a person) could try to pass one through to a VM.
             self._status_label.setText(
-                "WMI unavailable — showing sample devices"
+                "No USB devices found (Windows WMI did not answer, or nothing is plugged in)"
             )
         else:
             self._status_label.setText(

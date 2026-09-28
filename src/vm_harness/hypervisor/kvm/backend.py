@@ -17,6 +17,8 @@ import logging
 import os
 import platform
 import subprocess
+
+from vm_harness import _proc
 # Suppress CLI console windows on Windows
 CREATE_NO_WINDOW = 0x08000000
 from datetime import datetime
@@ -47,12 +49,13 @@ logger = logging.getLogger(__name__)
 DEFAULT_LIBVIRT_URI = "qemu:///system"
 
 
-def _run_virsh(args: list[str], timeout: int = 30) -> subprocess.CompletedProcess:
-    """Run a virsh command."""
-    return subprocess.run(
-        ["virsh", "-c", DEFAULT_LIBVIRT_URI] + args,
-        capture_output=True, text=True, timeout=timeout
-    )
+def _run_virsh_sync(args: list[str], timeout: int = 30, uri: str = DEFAULT_LIBVIRT_URI) -> subprocess.CompletedProcess:
+    return _proc.run_sync(["virsh", "-c", uri] + args, timeout=timeout)
+
+
+async def _run_virsh(args: list[str], timeout: int = 30, uri: str = DEFAULT_LIBVIRT_URI) -> subprocess.CompletedProcess:
+    """Run a virsh command off the event loop."""
+    return await _proc.run(["virsh", "-c", uri] + args, timeout=timeout)
 
 
 # ── KVMBackend ────────────────────────────────────────────────────────────────
@@ -82,7 +85,7 @@ class KVMBackend(HypervisorBackend):
     @property
     def version(self) -> str:
         try:
-            result = _run_virsh(["version"])
+            result = _run_virsh_sync(["version"], uri=self._libvirt_uri)
             if result.returncode == 0:
                 return result.stdout.split("\n")[0]
         except Exception:
@@ -121,7 +124,7 @@ class KVMBackend(HypervisorBackend):
     # ── Discovery ────────────────────────────────────────────────────────────
 
     async def list_vms(self) -> list[str]:
-        result = _run_virsh(["list", "--all", "--name"])
+        result = await _run_virsh(["list", "--all", "--name"])
         if result.returncode == 0:
             return [line.strip() for line in result.stdout.split("\n") if line.strip()]
         return []
@@ -135,7 +138,7 @@ class KVMBackend(HypervisorBackend):
         # Create disk
         disk_path = config.disk_path or f"/var/lib/libvirt/images/{config.name}.qcow2"
         if config.disk_size_gb > 0 and not os.path.isfile(disk_path):
-            subprocess.run(
+            await _proc.run(
                 ["qemu-img", "create", "-f", config.disk_format or "qcow2",
                  disk_path, f"{config.disk_size_gb}G"],
                 check=True, capture_output=True, text=True, timeout=60
@@ -148,7 +151,7 @@ class KVMBackend(HypervisorBackend):
             f.write(xml_content)
 
         # Define domain
-        result = subprocess.run(
+        result = await _proc.run(
             ["virsh", "-c", self._libvirt_uri, "define", str(xml_path)],
             capture_output=True, text=True, timeout=30
         )
@@ -182,7 +185,7 @@ class KVMBackend(HypervisorBackend):
             pass
 
         # Undefine
-        result = subprocess.run(
+        result = await _proc.run(
             ["virsh", "-c", self._libvirt_uri, "undefine", name, "--remove-all-storage"],
             capture_output=True, text=True, timeout=30
         )
@@ -200,7 +203,7 @@ class KVMBackend(HypervisorBackend):
     async def start_vm(self, name: str, headless: bool = False) -> None:
         if not await self.find_vm(name):
             raise VMNotFoundError(f"VM '{name}' not found")
-        result = subprocess.run(
+        result = await _proc.run(
             ["virsh", "-c", self._libvirt_uri, "start", name],
             capture_output=True, text=True, timeout=30
         )
@@ -212,7 +215,7 @@ class KVMBackend(HypervisorBackend):
         if not await self.find_vm(name):
             raise VMNotFoundError(f"VM '{name}' not found")
         cmd = "destroy" if force else "shutdown"
-        result = subprocess.run(
+        result = await _proc.run(
             ["virsh", "-c", self._libvirt_uri, cmd, name],
             capture_output=True, text=True, timeout=30
         )
@@ -221,7 +224,7 @@ class KVMBackend(HypervisorBackend):
     async def pause_vm(self, name: str) -> None:
         if not await self.find_vm(name):
             raise VMNotFoundError(f"VM '{name}' not found")
-        subprocess.run(
+        await _proc.run(
             ["virsh", "-c", self._libvirt_uri, "suspend", name],
             capture_output=True, text=True, timeout=30
         )
@@ -229,7 +232,7 @@ class KVMBackend(HypervisorBackend):
     async def resume_vm(self, name: str) -> None:
         if not await self.find_vm(name):
             raise VMNotFoundError(f"VM '{name}' not found")
-        subprocess.run(
+        await _proc.run(
             ["virsh", "-c", self._libvirt_uri, "resume", name],
             capture_output=True, text=True, timeout=30
         )
@@ -237,7 +240,7 @@ class KVMBackend(HypervisorBackend):
     async def reset_vm(self, name: str) -> None:
         if not await self.find_vm(name):
             raise VMNotFoundError(f"VM '{name}' not found")
-        subprocess.run(
+        await _proc.run(
             ["virsh", "-c", self._libvirt_uri, "reset", name],
             capture_output=True, text=True, timeout=30
         )
@@ -246,7 +249,7 @@ class KVMBackend(HypervisorBackend):
         if not await self.find_vm(name):
             raise VMNotFoundError(f"VM '{name}' not found")
         cmd = ["reboot"] if graceful else ["reset", "--force"]
-        subprocess.run(
+        await _proc.run(
             ["virsh", "-c", self._libvirt_uri, cmd[0], name],
             capture_output=True, text=True, timeout=30
         )
@@ -258,7 +261,7 @@ class KVMBackend(HypervisorBackend):
             raise VMNotFoundError(f"VM '{name}' not found")
 
         status = VMStatus(name=name, backend_name=self.default_name)
-        result = subprocess.run(
+        result = await _proc.run(
             ["virsh", "-c", self._libvirt_uri, "domstate", name],
             capture_output=True, text=True, timeout=10
         )
@@ -273,7 +276,7 @@ class KVMBackend(HypervisorBackend):
             status.state = state_map.get(state_str, VMState.UNKNOWN)
 
         # Get memory and CPU info
-        info_result = subprocess.run(
+        info_result = await _proc.run(
             ["virsh", "-c", self._libvirt_uri, "dominfo", name],
             capture_output=True, text=True, timeout=10
         )
@@ -294,7 +297,7 @@ class KVMBackend(HypervisorBackend):
     async def get_config(self, name: str) -> VMConfig | None:
         if not await self.find_vm(name):
             return None
-        result = subprocess.run(
+        result = await _proc.run(
             ["virsh", "-c", self._libvirt_uri, "dumpxml", name],
             capture_output=True, text=True, timeout=10
         )
@@ -324,7 +327,7 @@ class KVMBackend(HypervisorBackend):
 
         # Use virsh qemu-agent-command
         agent_args = ["qemu-agent-command", name, f"{{ 'command': 'guest-exec', 'arguments': {{ 'path': '{command}', 'arg': {args or []}, 'capture-output': {str(capture_output).lower()} }} }}"]
-        result = subprocess.run(
+        result = await _proc.run(
             ["virsh", "-c", self._libvirt_uri] + agent_args,
             capture_output=True, text=True, timeout=timeout
         )
@@ -338,7 +341,7 @@ class KVMBackend(HypervisorBackend):
     # ── Snapshots ────────────────────────────────────────────────────────────
 
     async def list_snapshots(self, name: str) -> list[VMSnapshot]:
-        result = subprocess.run(
+        result = await _proc.run(
             ["virsh", "-c", self._libvirt_uri, "snapshot-list", name],
             capture_output=True, text=True, timeout=10
         )
@@ -358,7 +361,7 @@ class KVMBackend(HypervisorBackend):
             args.extend(["--description", description])
         if include_memory:
             args.append("--atomic")
-        subprocess.run(
+        await _proc.run(
             ["virsh", "-c", self._libvirt_uri] + args,
             capture_output=True, text=True, timeout=60
         )
@@ -369,14 +372,14 @@ class KVMBackend(HypervisorBackend):
         )
 
     async def restore_snapshot(self, name: str, snapshot_name: str) -> None:
-        subprocess.run(
+        await _proc.run(
             ["virsh", "-c", self._libvirt_uri, "snapshot-revert",
              name, snapshot_name],
             capture_output=True, text=True, timeout=30
         )
 
     async def delete_snapshot(self, name: str, snapshot_name: str) -> None:
-        subprocess.run(
+        await _proc.run(
             ["virsh", "-c", self._libvirt_uri, "snapshot-delete",
              name, snapshot_name],
             capture_output=True, text=True, timeout=30

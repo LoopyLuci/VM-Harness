@@ -221,6 +221,8 @@ class KubernetesTreePanel(QWidget):
 
     def _refresh(self):
         """Refresh all Kubernetes resources."""
+        if not self.isVisible():
+            return  # a hidden panel does not poll its backends (that froze the window when one was down)
         try:
             from gui.async_adapter import get_adapter
             adapter = get_adapter()

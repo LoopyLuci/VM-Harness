@@ -100,9 +100,19 @@ class KubernetesBackend(ContainerBackend):
                     except Exception:
                         config.load_incluster_config()
 
-                self._core_v1 = client.CoreV1Api()
-                self._apps_v1 = client.AppsV1Api()
-                self._networking_v1 = client.NetworkingV1Api()
+                # A cluster that is down must fail fast: the default client retries each call three times and
+                # takes seconds to give up, which froze anything waiting on it (the GUI's container page did).
+                cfg = client.Configuration.get_default_copy()
+                cfg.retries = 0
+                api = client.ApiClient(cfg)
+                try:
+                    client.VersionApi(api).get_code(_request_timeout=(3, 5))
+                except Exception as e:  # noqa: BLE001
+                    api.close()
+                    raise KubernetesError(f"Kubernetes cluster not reachable ({cfg.host}): {type(e).__name__}", e)
+                self._core_v1 = client.CoreV1Api(api)
+                self._apps_v1 = client.AppsV1Api(api)
+                self._networking_v1 = client.NetworkingV1Api(api)
                 self._watcher = KubernetesWatcher(
                     self._core_v1,
                     self._apps_v1,

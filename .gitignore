@@ -97,3 +97,7 @@ android/local.properties
 ci/artifacts/desktop/*.exe
 ci/artifacts/desktop/*.zip
 ci/artifacts/desktop/*.sha256
+
+# Build output and runtime state (never commit)
+target/
+.vmharness_state/

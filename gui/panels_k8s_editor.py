@@ -153,8 +153,16 @@ class KubernetesEditorPanel(QWidget):
 
         self._refresh()
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Refresh when shown (the timer skips hidden panels), after the switch has painted.
+        from PyQt5.QtCore import QTimer as _QTimer
+        _QTimer.singleShot(0, self._refresh)
+
     def _refresh(self):
         """Refresh all Kubernetes resources."""
+        if not self.isVisible():
+            return  # a hidden panel does not poll its backends (that froze the window when one was down)
         try:
             from gui.async_adapter import get_adapter
             adapter = get_adapter()
