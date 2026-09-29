@@ -1032,12 +1032,23 @@ class QEMUBackend(HypervisorBackend):
                 args.extend(["-accel", "kvm"])
         args.extend(["-accel", "tcg"])
 
-        # Firmware
+        # Firmware. UEFI gets its code (read-only) and a variable store of its own in the VM's folder, so boot
+        # entries an installed OS writes (and the firmware's own settings) survive restarts as on real hardware.
+        # Without the store the firmware forgets every boot entry and may stop at its shell instead of booting the
+        # disk.
         if config.get("boot_firmware", "bios") == "uefi":
             fw = _firmware("edk2-x86_64-code.fd", self._qemu_binary) or _firmware("OVMF_CODE.fd", self._qemu_binary)
             if not fw:
                 raise HypervisorError("UEFI firmware (edk2-x86_64-code.fd) not found next to QEMU")
             args.extend(["-drive", f"if=pflash,format=raw,readonly=on,file={fw}"])
+            vars_file = self._vms_dir / name / "efivars.fd"
+            if not vars_file.is_file():
+                template = _firmware("edk2-i386-vars.fd", self._qemu_binary) or _firmware("OVMF_VARS.fd", self._qemu_binary)
+                if template:
+                    vars_file.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(template, vars_file)
+            if vars_file.is_file():
+                args.extend(["-drive", f"if=pflash,format=raw,file={vars_file}"])
 
         # Network
         net_mode = config.get("network_mode", "nat")
@@ -1054,10 +1065,17 @@ class QEMUBackend(HypervisorBackend):
             nic_args.append(f"mac={mac_address}")
         args.extend(["-device", ",".join(nic_args)])
 
+        # Boot priority: the system disk first, unless the ISO is meant to boot first (installing). bootindex is what
+        # UEFI firmware follows (it ignores -boot); SeaBIOS honours it too.
+        iso_first = bool(iso_path and os.path.exists(iso_path)) and (
+            (boot_order[0] if isinstance(boot_order, list) and boot_order else str(boot_order)[:1]) in ("cdrom", "d"))
+        disk_index, iso_index = (1, 0) if iso_first else (0, 1)
+
         # Disk
         if disk_path:
             args.extend([
-                "-drive", f"if=virtio,format={disk_format},file={disk_path}"
+                "-drive", f"if=none,id=disk0,format={disk_format},file={disk_path}",
+                "-device", f"virtio-blk-pci,drive=disk0,bootindex={disk_index}",
             ])
 
         # Additional disks
@@ -1094,8 +1112,8 @@ class QEMUBackend(HypervisorBackend):
         # ISO
         if iso_path and os.path.exists(iso_path):
             args.extend([
-                "-drive", f"if=ide,media=cdrom,file={iso_path}",
-                "-boot", "".join(boot_order) if isinstance(boot_order, list) else boot_order,
+                "-drive", f"if=none,id=cd0,media=cdrom,readonly=on,file={iso_path}",
+                "-device", f"ide-cd,drive=cd0,bootindex={iso_index}",
             ])
 
         # Guest agent
