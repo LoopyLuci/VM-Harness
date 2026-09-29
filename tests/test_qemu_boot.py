@@ -51,3 +51,25 @@ def test_the_disk_boots_first_unless_installing(tmp_path, monkeypatch):
     devices = _pairs(args, "-device")
     assert "virtio-blk-pci,drive=disk0,bootindex=1" in devices and "ide-cd,drive=cd0,bootindex=0" in devices
     assert "-boot" not in args, "UEFI ignores -boot; bootindex decides"
+
+
+def test_usage_is_measured_on_the_host():
+    """A running VM's CPU and memory come from its QEMU process (QMP has no usage query)."""
+    import subprocess
+    import sys
+    # the real interpreter: a venv python.exe on Windows is a launcher whose child does the work
+    exe = getattr(sys, "_base_executable", "") or sys.executable
+    busy = subprocess.Popen([exe, "-c", "x = bytearray(80 * 1024 * 1024)\nwhile True: pass"])
+    try:
+        import time
+        time.sleep(1.0)
+        cpu, rss = qb._process_usage(busy.pid, 1)
+        time.sleep(0.5)
+        cpu, rss = qb._process_usage(busy.pid, 1)  # a second reading covers the time since the first
+        assert cpu > 20, cpu
+        assert rss >= 70, rss
+        assert qb._process_usage(busy.pid, 4)[0] <= 100
+    finally:
+        busy.kill()
+        busy.wait()
+    assert qb._process_usage(busy.pid, 1) == (0.0, 0)

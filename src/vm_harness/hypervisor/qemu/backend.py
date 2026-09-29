@@ -86,6 +86,36 @@ def _firmware(name: str, qemu_binary: str) -> str | None:
     return None
 
 
+_USAGE_PROCS: dict[int, Any] = {}
+
+
+def _process_usage(pid: int, cpus: int) -> tuple[float, int]:
+    """(CPU %, resident MB) of a VM's QEMU process, measured on the host.
+
+    QMP has no CPU-usage query (query-cpus-fast carries no times), and query-memory-size-summary is the configured
+    size, not what the guest uses; the host's view of the process is the honest number. CPU is a share of the VM's
+    own vCPUs (100% = every vCPU busy). The psutil.Process is kept per pid so each reading covers the time since the
+    last one; the first reading samples briefly.
+    """
+    try:
+        import psutil
+    except ImportError:
+        return 0.0, 0
+    try:
+        proc = _USAGE_PROCS.get(pid)
+        if proc is None or not proc.is_running():
+            proc = psutil.Process(pid)
+            _USAGE_PROCS[pid] = proc
+            proc.cpu_percent(None)
+            time.sleep(0.2)
+        cpu = proc.cpu_percent(None) / max(1, cpus)
+        rss = proc.memory_info().rss // (1024 * 1024)
+        return round(min(cpu, 100.0), 1), int(rss)
+    except (psutil.Error, OSError):
+        _USAGE_PROCS.pop(pid, None)
+        return 0.0, 0
+
+
 class _RunningVM:
     """A VM's QEMU process, found again from its run file after this process (or the service) restarts.
 
@@ -520,6 +550,12 @@ class QEMUBackend(HypervisorBackend):
         status.ram_allocated_mb = config.get("ram_mb", 0)
         status.cpus_allocated = config.get("cpus", 0)
         status.management_uri = f"tcp:127.0.0.1:{config.get('management_port', 0)}"
+        disk = config.get("disk_path", "")
+        if disk and os.path.isfile(disk):
+            status.disk_usage_gb = round(os.path.getsize(disk) / 1024 ** 3, 2)
+        if status.state == VMState.RUNNING and status.pid:
+            status.cpu_usage_pct, status.ram_usage_mb = await asyncio.to_thread(
+                _process_usage, status.pid, int(status.cpus_allocated or 1))
 
         # Get QMP status if running
         if status.state == VMState.RUNNING:
@@ -550,24 +586,13 @@ class QEMUBackend(HypervisorBackend):
         client = await self._require_qmp_client(name)
         metrics = VMMetrics(timestamp=datetime.now().isoformat())
 
-        try:
-            # Query CPU usage
-            result = await client.send("query-cpus-fast")
-            cpus = result.get("return", [])
-            if cpus:
-                total_cpu = sum(cpu.get("cpu-time", 0) for cpu in cpus)
-                metrics.cpu_usage_pct = min(total_cpu / 1e7, 100.0)
-        except Exception:
-            pass
-
-        try:
-            # Query memory
-            result = await client.send("query-memory-size-summary")
-            mem_data = result.get("return", {})
-            metrics.ram_usage_mb = mem_data.get("base-memory", 0) // (1024 * 1024)
-            metrics.ram_available_mb = mem_data.get("remaining-memory", 0) // (1024 * 1024)
-        except Exception:
-            pass
+        # CPU and memory: measured on the host (QMP cannot say how busy the guest is).
+        proc = self._processes.get(name)
+        if proc is not None:
+            config = await self._load_vm_config(name)
+            cpus = int(config.get("cpus", 1) or 1)
+            metrics.cpu_usage_pct, metrics.ram_usage_mb = await asyncio.to_thread(_process_usage, proc.pid, cpus)
+            metrics.ram_available_mb = max(0, int(config.get("ram_mb", 0)) - metrics.ram_usage_mb)
 
         try:
             # Query block stats
