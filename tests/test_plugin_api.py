@@ -25,6 +25,12 @@ from PyQt5.QtWidgets import QApplication, QWidget
 from gui.plugin import PanelPlugin, VMHarnessPlugin
 from gui.plugin_manager import PluginManager
 
+import pytest
+
+# Plugins are imported by module name into the running process, so these tests depend on what ran before them on
+# the same worker: keep every plugin test on one xdist worker (the pipeline runs with --dist loadgroup).
+pytestmark = pytest.mark.xdist_group("plugins")
+
 # Skip the entire test class if no plugins are discovered
 def _plugins_available():
     pm = PluginManager()

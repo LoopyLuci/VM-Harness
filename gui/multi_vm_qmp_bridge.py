@@ -183,7 +183,7 @@ class PerVMQMPBridge(QObject):
             status = await qmp_mod.query_status(client)
             self.vm_status.emit(self._vm_name, status)
             return status
-        except QMPTimeoutError as e:
+        except TimeoutError as e:  # asyncio's timeouts are TimeoutError
             logger.error("QMP get_status timed out for %s: %s", self._vm_name, e)
             self.error.emit(self._vm_name, f"Status timed out: {e}")
             return {}

@@ -20,6 +20,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import platform
 import struct
 import time
@@ -792,82 +793,143 @@ class QMCMApiServer:
             "machine_id": compute_machine_id(self._credential_store_dir),
         })
 
-    async def _handle_vms_list(self, request: web.Request) -> web.Response:
-        """GET /api/v1/vms — list all VMs."""
+    # -- the hub: every VM on every hypervisor ------------------------------------------------------------------
+    async def _hub_call(self, op: str, args: dict | None = None, timeout: float = 300.0) -> Any:
+        """Run a VM-Harness operation through the hub (started if needed), off the event loop."""
+        from vm_harness.control.client import HubClient
+
+        def go() -> Any:
+            return HubClient.connect(start=True, client_name="phone").call(op, dict(args or {}), timeout=timeout)
+        return await asyncio.to_thread(go)
+
+    @staticmethod
+    def _hub_error(exc: Exception) -> web.HTTPException:
+        code = getattr(exc, "code", "") or ""
+        body = json.dumps({"error": str(exc), "code": code})
+        if code in ("not_found", "vm_not_found") or "not found" in str(exc).lower():
+            return web.HTTPNotFound(text=body, content_type="application/json")
+        if code in ("bad_arguments", "invalid_arguments"):
+            return web.HTTPBadRequest(text=body, content_type="application/json")
+        return web.HTTPBadGateway(text=body, content_type="application/json")
+
+    @staticmethod
+    def _vm_summary(v: dict) -> dict:
+        st = v.get("status") or {}
+        return {
+            "name": v.get("name", ""), "status": v.get("state") or st.get("state", "unknown"), "backend": v.get("backend", ""),
+            "qmpUri": st.get("management_uri", ""), "sshUri": "", "ram": int(st.get("ram_allocated_mb") or 0),
+            "vcpus": int(st.get("cpus_allocated") or 0), "disk": int(st.get("disk_allocated_gb") or 0),
+            "uptime": f"{int(st.get('uptime_seconds') or 0)}s", "lastStarted": st.get("started_at", ""),
+            "cpuPercent": st.get("cpu_usage_pct", 0), "ramUsedMb": st.get("ram_usage_mb", 0),
+        }
+
+    # -- snapshots (through the hub) --------------------------------------------------------------------------------
+    async def _handle_snapshots_list(self, request: web.Request) -> web.Response:
+        """GET /api/v1/vms/{name}/snapshots"""
         ctx = await self._require_tailscale_or_auth(request)
-        # Adapt to the desktop's VM listing — best-effort
-        vms: list[dict[str, Any]] = []
-        if self.multi_vm_bridge is not None and hasattr(self.multi_vm_bridge, "list_vms"):
-            try:
-                vms = self.multi_vm_bridge.list_vms()
-            except Exception as e:
-                log.debug("multi_vm_bridge.list_vms failed: %s", e)
-        await self._audit(ctx, "vms_list", json.dumps({}),
-                          "ok" if vms else "empty")
+        vm_name = request.match_info["name"]
+        try:
+            snaps = await self._hub_call("vm.snapshot.list", {"name": vm_name})
+        except Exception as e:  # noqa: BLE001
+            raise self._hub_error(e) from e
+        await self._audit(ctx, "snapshot_list", json.dumps({"vm": vm_name}), "ok")
+        return web.json_response([{"name": x.get("name", ""), "vmName": vm_name, "created": x.get("created_at", ""),
+                                   "sizeBytes": int(x.get("size_bytes") or 0), "current": bool(x.get("is_current"))}
+                                  for x in snaps or []])
+
+    async def _handle_snapshot_create(self, request: web.Request) -> web.Response:
+        """POST /api/v1/vms/{name}/snapshots  {name, description?}"""
+        ctx = await self._require_tailscale_or_auth(request)
+        vm_name = request.match_info["name"]
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, aiohttp.ContentTypeError):
+            body = {}
+        snap = str(body.get("name", "")).strip() or f"snapshot-{int(time.time())}"
+        try:
+            await self._hub_call("vm.snapshot.create", {"name": vm_name, "snapshot_name": snap,
+                                                        "description": str(body.get("description", ""))})
+        except Exception as e:  # noqa: BLE001
+            await self._audit(ctx, "snapshot_create", json.dumps({"vm": vm_name, "snapshot": snap}), "error", str(e))
+            raise self._hub_error(e) from e
+        await self._audit(ctx, "snapshot_create", json.dumps({"vm": vm_name, "snapshot": snap}), "ok")
+        return web.json_response({"vm": vm_name, "action": "create_snapshot", "status": "ok", "detail": f"Snapshot '{snap}' created"})
+
+    async def _handle_snapshot_restore(self, request: web.Request) -> web.Response:
+        """POST /api/v1/vms/{name}/snapshots/{snapshot_name}/restore"""
+        ctx = await self._require_tailscale_or_auth(request)
+        vm_name = request.match_info["name"]
+        snap = request.match_info["snapshot_name"]
+        try:
+            await self._hub_call("vm.snapshot.restore", {"name": vm_name, "snapshot_name": snap})
+        except Exception as e:  # noqa: BLE001
+            await self._audit(ctx, "snapshot_restore", json.dumps({"vm": vm_name, "snapshot": snap}), "error", str(e))
+            raise self._hub_error(e) from e
+        await self._audit(ctx, "snapshot_restore", json.dumps({"vm": vm_name, "snapshot": snap}), "ok")
+        return web.json_response({"vm": vm_name, "action": "restore_snapshot", "status": "ok", "detail": f"Snapshot '{snap}' restored"})
+
+    async def _handle_vms_list(self, request: web.Request) -> web.Response:
+        """GET /api/v1/vms: every VM on every hypervisor the hub reaches."""
+        ctx = await self._require_tailscale_or_auth(request)
+        try:
+            vms = [self._vm_summary(v) for v in await self._hub_call("vm.list", {})]
+        except Exception as e:  # noqa: BLE001 - the hub is not reachable: fall back to the window's own bridge
+            log.warning("vm.list through the hub failed (%s); using the desktop bridge", e)
+            vms = []
+            if self.multi_vm_bridge is not None and hasattr(self.multi_vm_bridge, "list_vms"):
+                try:
+                    vms = self.multi_vm_bridge.list_vms()
+                except Exception as e2:  # noqa: BLE001
+                    log.debug("multi_vm_bridge.list_vms failed: %s", e2)
+        await self._audit(ctx, "vms_list", json.dumps({}), "ok" if vms else "empty")
         return web.json_response(vms)
 
     async def _handle_vm_detail(self, request: web.Request) -> web.Response:
-        """GET /api/v1/vms/{name} — detail for one VM."""
+        """GET /api/v1/vms/{name}: state, configuration, network interfaces."""
         ctx = await self._require_tailscale_or_auth(request)
         vm_name = request.match_info["name"]
-        detail: dict[str, Any] = {"name": vm_name, "status": "unknown"}
-        if self.qmp_bridge is not None and hasattr(self.qmp_bridge, "get_status"):
-            try:
-                detail["status"] = self.qmp_bridge.get_status()
-            except Exception:
-                pass
+        try:
+            status, config = await asyncio.gather(self._hub_call("vm.status", {"name": vm_name}),
+                                                  self._hub_call("vm.config", {"name": vm_name}))
+        except Exception as e:  # noqa: BLE001
+            await self._audit(ctx, "vm_detail", json.dumps({"vm": vm_name}), "error", str(e))
+            raise self._hub_error(e) from e
+        config = config or {}
+        detail = {
+            "name": vm_name, "status": status.get("state", "unknown"),
+            "config": {k: (v if isinstance(v, str) else json.dumps(v)) for k, v in config.items() if not isinstance(v, (bytes, bytearray))},
+            "networkInterfaces": [{k: str(v) for k, v in n.items()} for n in status.get("network_interfaces") or [] if isinstance(n, dict)],
+            "blockDevices": [], "qmpUri": status.get("management_uri", ""), "sshUri": "",
+            "cpuPercent": status.get("cpu_usage_pct", 0), "ramUsedMb": status.get("ram_usage_mb", 0),
+            "ramAllocatedMb": status.get("ram_allocated_mb", 0), "uptimeSeconds": status.get("uptime_seconds", 0),
+        }
         await self._audit(ctx, "vm_detail", json.dumps({"vm": vm_name}), "ok")
         return web.json_response(detail)
 
     # -- VM lifecycle actions --
 
     async def _handle_vm_action(self, request: web.Request) -> web.Response:
-        """POST /api/v1/vms/{name}/{action} — start/stop/reset/powerdown/pause/resume/eject."""
+        """POST /api/v1/vms/{name}/{action}: start, stop, powerdown, reset, reboot, pause, resume, eject."""
         ctx = await self._require_tailscale_or_auth(request)
         vm_name = request.match_info["name"]
         action = request.match_info["action"]
-
-        qmp = self._require(self.qmp_bridge, "qmp_bridge")
-        action_map = {
-            "start": "start",
-            "stop": "stop",
-            "reset": "system_reset",
-            "powerdown": "system_powerdown",
-            "pause": "stop",        # QMP stop = pause
-            "resume": "cont",
-            "eject": "eject_cdrom",
+        ops = {
+            "start": ("vm.start", {"headless": True}), "stop": ("vm.stop", {"force": True}),
+            "powerdown": ("vm.stop", {"force": False}), "shutdown": ("vm.shutdown_guest", {}),
+            "reset": ("vm.reset", {}), "reboot": ("vm.reboot", {}), "pause": ("vm.pause", {}),
+            "resume": ("vm.resume", {}), "eject": ("vm.cdrom.eject", {}),
         }
-        qmp_method = action_map.get(action)
-        if qmp_method is None:
-            raise web.HTTPBadRequest(text=json.dumps({"error": f"unknown_action: {action}"}))
-
-        method = getattr(qmp, qmp_method, None)
-        if method is None:
-            raise web.HTTPInternalServerError(text=json.dumps({"error": f"qmp_bridge has no {qmp_method}"}))
-
+        if action not in ops:
+            raise web.HTTPBadRequest(text=json.dumps({"error": f"unknown_action: {action}", "actions": sorted(ops)}),
+                                     content_type="application/json")
+        op, extra = ops[action]
         try:
-            # QMP bridge methods are synchronous in the desktop app
-            result = method()
-            status = "ok"
-            detail = str(result) if result is not None else ""
-        except Exception as e:
-            status = "error"
-            detail = str(e)
-            log.exception("VM action %s on %s failed", action, vm_name)
-
-        await self._audit(
-            ctx,
-            f"vm_{action}",
-            json.dumps({"vm": vm_name, "action": action, "detail": detail}),
-            status,
-            detail if status == "error" else "",
-        )
-        return web.json_response({
-            "vm": vm_name,
-            "action": action,
-            "status": status,
-            "detail": detail,
-        })
+            await self._hub_call(op, {"name": vm_name, **extra})
+        except Exception as e:  # noqa: BLE001
+            await self._audit(ctx, f"vm_{action}", json.dumps({"vm": vm_name}), "error", str(e))
+            raise self._hub_error(e) from e
+        await self._audit(ctx, f"vm_{action}", json.dumps({"vm": vm_name}), "ok")
+        return web.json_response({"vm": vm_name, "action": action, "status": "ok", "detail": f"{op} done"})
 
     # -- QMP console (WebSocket) --
 
@@ -981,14 +1043,20 @@ class QMCMApiServer:
     # -- metrics --
 
     async def _handle_metrics(self, request: web.Request) -> web.Response:
-        """GET /api/v1/metrics — host metrics snapshot."""
+        """GET /api/v1/metrics: this host's CPU, memory, disk and network, measured now."""
         ctx = await self._require_tailscale_or_auth(request)
-        metrics: dict[str, Any] = {}
-        if self.metrics_store is not None and hasattr(self.metrics_store, "get_summary"):
-            try:
-                metrics = self.metrics_store.get_summary()
-            except Exception:
-                pass
+
+        def measure() -> dict[str, Any]:
+            import psutil
+            mem = psutil.virtual_memory()
+            disk = psutil.disk_usage(os.path.abspath(os.sep))
+            net = psutil.net_io_counters()
+            gib = 1024 ** 3
+            return {"cpuPercent": psutil.cpu_percent(interval=0.2), "ramUsed": round(mem.used / gib, 2),
+                    "ramTotal": round(mem.total / gib, 2), "diskUsed": round(disk.used / gib, 1),
+                    "diskTotal": round(disk.total / gib, 1), "networkRx": float(net.bytes_recv),
+                    "networkTx": float(net.bytes_sent), "timestamp": int(time.time())}
+        metrics = await asyncio.to_thread(measure)
         await self._audit(ctx, "metrics_view", json.dumps({}), "ok")
         return web.json_response(metrics)
 
@@ -1080,70 +1148,65 @@ class QMCMApiServer:
     # -- audit log --
 
     async def _handle_audit(self, request: web.Request) -> web.Response:
-        """GET /api/v1/security/audit — audit log entries."""
+        """GET /api/v1/security/audit?limit=: what was changed, by whom (VM-Harness's hash-chained audit log)."""
         ctx = await self._require_tailscale_or_auth(request)
-        if self._audit_logger is None:
-            return web.json_response([])
-        # Best-effort — adapt to the actual audit logger API
         try:
-            # The desktop audit logger has a query() method; call it
-            # For now, return empty — the actual integration will fill this in
-            entries = []
-        except Exception:
-            entries = []
-        await self._audit(ctx, "audit_view", json.dumps({}), "ok")
+            limit = max(1, min(1000, int(request.query.get("limit", "200"))))
+        except ValueError:
+            limit = 200
+        try:
+            rows = await self._hub_call("audit.query", {"limit": limit})
+        except Exception as e:  # noqa: BLE001
+            raise self._hub_error(e) from e
+        entries = []
+        for i, r in enumerate(rows or []):
+            args = r.get("args") if isinstance(r.get("args"), dict) else {}
+            ts = r.get("ts")
+            entries.append({
+                "id": i, "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(ts)) if isinstance(ts, (int, float)) else str(ts or ""),
+                "event": r.get("operation", ""), "details": json.dumps(args)[:500], "sourceIp": "", "user": r.get("client", ""),
+                "vmName": str(args.get("name", "")), "status": "ok" if r.get("ok") else "error", "error": r.get("error") or "",
+            })
+        await self._audit(ctx, "audit_view", json.dumps({"limit": limit}), "ok")
         return web.json_response(entries)
 
     # -- logs --
 
     async def _handle_logs(self, request: web.Request) -> web.Response:
-        """GET /api/v1/logs — application logs."""
+        """GET /api/v1/logs?lines=&level=: the newest lines of VM-Harness's hub log, parsed."""
         ctx = await self._require_tailscale_or_auth(request)
-        # Best-effort — adapt to actual log storage
-        return web.json_response({"logs": [], "note": "log endpoint not yet connected to desktop log store"})
+        try:
+            want = max(1, min(2000, int(request.query.get("lines", "200"))))
+        except ValueError:
+            want = 200
+        level = request.query.get("level", "").upper()
+        home = Path(os.environ.get("VMH_HOME") or Path.home() / ".vmharness")
+        pattern = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d(?:,\d+)?) (\w+) ([\w.]+): (.*)$")
+
+        def read() -> tuple[list[dict], bool]:
+            path = home / "hub.log"
+            if not path.is_file():
+                return [], False
+            with open(path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - 512 * 1024))
+                lines = f.read().decode("utf-8", errors="replace").splitlines()
+            out: list[dict] = []
+            for line in lines:
+                m = pattern.match(line)
+                if m:
+                    out.append({"timestamp": m.group(1), "level": m.group(2), "logger": m.group(3), "message": m.group(4)})
+                elif out:  # a traceback or wrapped line belongs to the entry above
+                    out[-1]["message"] += "\n" + line
+            if level:
+                out = [e for e in out if e["level"] == level]
+            return out[-want:], len(out) > want
+        logs, more = await asyncio.to_thread(read)
+        await self._audit(ctx, "logs_view", json.dumps({"lines": want}), "ok")
+        return web.json_response({"logs": logs, "hasMore": more})
 
     # -- snapshots --
-
-    async def _handle_list_snapshots(self, request: web.Request) -> web.Response:
-        """GET /api/v1/vms/{name}/snapshots — list VM snapshots."""
-        ctx = await self._require_tailscale_or_auth(request)
-        vm_name = request.match_info.get("name", "")
-        # Return empty list — actual implementation will query qemu-img
-        return web.json_response([])
-
-    async def _handle_create_snapshot(self, request: web.Request) -> web.Response:
-        """POST /api/v1/vms/{name}/snapshots — create snapshot."""
-        ctx = await self._require_tailscale_or_auth(request)
-        vm_name = request.match_info.get("name", "")
-        try:
-            body = await request.json()
-        except:
-            body = {}
-        snap_name = body.get("name", "").strip() or f"snapshot-{int(time.time())}"
-        await self._audit(ctx, "snapshot_create", json.dumps({"vm": vm_name, "snapshot": snap_name}), "ok")
-        return web.json_response({"vm": vm_name, "action": "create_snapshot", "status": "ok", "detail": f"Snapshot '{snap_name}' created"})
-
-    async def _handle_restore_snapshot(self, request: web.Request) -> web.Response:
-        """POST /api/v1/vms/{name}/snapshots/{snapshot_name}/restore — restore snapshot."""
-        ctx = await self._require_tailscale_or_auth(request)
-        vm_name = request.match_info.get("name", "")
-        snap_name = request.match_info.get("snapshot_name", "")
-        await self._audit(ctx, "snapshot_restore", json.dumps({"vm": vm_name, "snapshot": snap_name}), "ok")
-        return web.json_response({"vm": vm_name, "action": "restore_snapshot", "status": "ok", "detail": f"Snapshot '{snap_name}' restored"})
-
-    async def _handle_qmp_command(self, request: web.Request) -> web.Response:
-        """POST /api/v1/vms/{name}/qmp_cmd — execute QMP command."""
-        ctx = await self._require_tailscale_or_auth(request)
-        vm_name = request.match_info.get("name", "")
-        try:
-            body = await request.json()
-        except:
-            raise web.HTTPBadRequest(text=json.dumps({"error": "invalid_json"}))
-        command = body.get("command", "").strip()
-        if not command:
-            raise web.HTTPBadRequest(text=json.dumps({"error": "missing_command"}))
-        await self._audit(ctx, "qmp_command", json.dumps({"vm": vm_name, "command": command}), "ok")
-        return web.json_response({"vm": vm_name, "command": command, "output": "Command acknowledged", "return_code": 0})
 
     # ── route table ───────────────────────────────────────────────────────────
 
@@ -1193,6 +1256,10 @@ class QMCMApiServer:
         app.router.add_get("/api/v1/", self._handle_dashboard)
         app.router.add_get("/api/v1/vms", self._handle_vms_list)
         app.router.add_get("/api/v1/vms/{name}", self._handle_vm_detail)
+        # Specific routes first: /vms/{name}/{action} would otherwise swallow "snapshots".
+        app.router.add_get("/api/v1/vms/{name}/snapshots", self._handle_snapshots_list)
+        app.router.add_post("/api/v1/vms/{name}/snapshots", self._handle_snapshot_create)
+        app.router.add_post("/api/v1/vms/{name}/snapshots/{snapshot_name}/restore", self._handle_snapshot_restore)
         app.router.add_post("/api/v1/vms/{name}/{action}", self._handle_vm_action)
         app.router.add_get("/api/v1/vms/{name}/qmp", self._handle_qmp_websocket)
         app.router.add_get("/api/v1/vms/{name}/terminal", self._handle_ssh_terminal)

@@ -14,6 +14,7 @@ import hashlib
 import hmac
 import logging
 import os
+import socket
 import struct
 import time
 from dataclasses import dataclass, field

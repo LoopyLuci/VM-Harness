@@ -30,6 +30,12 @@ QCoreApplication.setAttribute(Qt.AA_ShareOpenGLContexts)
 
 from PyQt5.QtWidgets import QApplication
 
+import pytest
+
+# Plugins are imported by module name into the running process, so these tests depend on what ran before them on
+# the same worker: keep every plugin test on one xdist worker (the pipeline runs with --dist loadgroup).
+pytestmark = pytest.mark.xdist_group("plugins")
+
 # ── Project paths ──────────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:

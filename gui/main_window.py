@@ -30,7 +30,7 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QSystemTrayIcon,
     QMenu,
-    QAction,
+    QAction, QApplication,
 )
 
 # Ensure project root and src are on path

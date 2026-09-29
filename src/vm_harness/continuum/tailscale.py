@@ -9,6 +9,7 @@ calls to the ``tailscale`` CLI.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import socket
 import time

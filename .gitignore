@@ -39,7 +39,7 @@ Thumbs.db
 # GUI credential store (encrypted secrets — never commit)
 .local/share/qmcmcp/
 .config/qmcmcp/
-%LOCALAPPDATA%\qmcmcp\
+qmcmcp/
 
 # Test artifacts
 .pytest_cache/
@@ -101,3 +101,8 @@ ci/artifacts/desktop/*.sha256
 # Build output and runtime state (never commit)
 target/
 .vmharness_state/
+
+# Local CI/CD pipeline (ci/pipeline.py): its logs, reports and lock
+ci/logs/
+ci/reports/
+ci/.pipeline.lock

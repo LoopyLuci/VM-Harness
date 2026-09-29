@@ -38,7 +38,7 @@ from PyQt5.QtWidgets import (
     QPlainTextEdit, QComboBox, QCheckBox, QSpinBox, QTreeWidget,
     QTreeWidgetItem, QHeaderView, QScrollArea, QGroupBox, QTabWidget,
     QMessageBox, QInputDialog, QFileDialog, QApplication,
-    QHBoxLayout, QVBoxLayout, QGridLayout, QSizePolicy,
+    QHBoxLayout, QVBoxLayout, QGridLayout, QSizePolicy, QProgressBar,
 )
 from typing import Optional, List, Dict, Any
 import pathlib
@@ -67,9 +67,9 @@ class StatusIndicator(QWidget):
 
     color_changed = pyqtSignal(QColor)
 
-    def __init__(self, color: QColor = QColor(T.DOT_OFFLINE), parent=None):
+    def __init__(self, color: Optional[QColor] = None, parent=None):
         super().__init__(parent)
-        self._color = color
+        self._color = color if color is not None else QColor(T.DOT_OFFLINE)
         self._pulse_enabled = False
         self._pulse_timer = QTimer(self)
         self._pulse_timer.setInterval(800)

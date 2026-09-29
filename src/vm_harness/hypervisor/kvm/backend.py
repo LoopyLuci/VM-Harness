@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import platform
+import shutil
 import subprocess
 
 from vm_harness import _proc
@@ -28,6 +29,9 @@ from typing import Any
 from vm_harness.hypervisor.backend import (
     BackendNotAvailableError,
     HypervisorBackend,
+    HypervisorError,
+    OperationNotSupportedError,
+    VMAlreadyRunningError,
     VMConfig,
     VMConsole,
     VMDisplay,
@@ -38,7 +42,6 @@ from vm_harness.hypervisor.backend import (
     VMNetworkMode,
     VMNotFoundError,
     VMNotRunningError,
-    OperationNotSupportedError,
     VMSnapshot,
     VMState,
     VMStatus,

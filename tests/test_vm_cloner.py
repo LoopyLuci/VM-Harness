@@ -425,8 +425,7 @@ class TestCloneWorker:
         worker = CloneWorker(fake_qemu_img, "linked", str(base), dest)
         progress_values = []
         worker.progress.connect(lambda pct, msg: progress_values.append(pct))
-        worker.start()
-        qtbot.waitUntil(lambda: not worker.isRunning(), timeout=30000)  # qemu-img under a loaded machine can take a while
+        worker.run()  # on this thread: the signals arrive at once (no dependence on the event loop's state)
         assert len(progress_values) > 0
 
     def test_worker_finished_ok_signal(self, fake_qemu_img, tmp_path, qtbot):
@@ -436,8 +435,7 @@ class TestCloneWorker:
         worker = CloneWorker(fake_qemu_img, "linked", str(base), dest)
         results = []
         worker.finished_ok.connect(lambda path: results.append(path))
-        worker.start()
-        qtbot.waitUntil(lambda: not worker.isRunning(), timeout=30000)  # qemu-img under a loaded machine can take a while
+        worker.run()  # on this thread: the signals arrive at once (no dependence on the event loop's state)
         assert len(results) == 1
         assert results[0] == dest
 
@@ -445,8 +443,7 @@ class TestCloneWorker:
         worker = CloneWorker(fake_qemu_img, "linked", "/nonexistent/path.qcow2", str(tmp_path / "dest.qcow2"))
         errors = []
         worker.failed.connect(lambda msg: errors.append(msg))
-        worker.start()
-        qtbot.waitUntil(lambda: not worker.isRunning(), timeout=30000)  # qemu-img under a loaded machine can take a while
+        worker.run()  # on this thread: the signals arrive at once (no dependence on the event loop's state)
         assert len(errors) > 0
 
     def test_worker_unknown_operation(self, fake_qemu_img, tmp_path, qtbot):
@@ -455,8 +452,7 @@ class TestCloneWorker:
         worker = CloneWorker(fake_qemu_img, "unknown_op", str(base), str(tmp_path / "dest.qcow2"))
         errors = []
         worker.failed.connect(lambda msg: errors.append(msg))
-        worker.start()
-        qtbot.waitUntil(lambda: not worker.isRunning(), timeout=30000)  # qemu-img under a loaded machine can take a while
+        worker.run()  # on this thread: the signals arrive at once (no dependence on the event loop's state)
         assert any("unknown" in e.lower() for e in errors)
 
 

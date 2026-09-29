@@ -65,6 +65,11 @@ class TestImagePullDialog(unittest.TestCase):
 
     def test_pull_alpine_latest(self):
         """Pull alpine:latest and verify the dialog closes on completion."""
+        try:
+            import docker
+            docker.from_env(timeout=5).ping()
+        except Exception as exc:  # noqa: BLE001 - no Docker daemon here: nothing to pull from
+            self.skipTest(f"Docker is not running: {exc}")
         # Retry up to 3 times to handle QThread timing flakiness
         for attempt in range(3):
             dlg = _TestableImagePullDialog("alpine:latest")
