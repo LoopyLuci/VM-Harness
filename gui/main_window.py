@@ -367,10 +367,11 @@ class MainWindow(QMainWindow):
         self.title_bar = TitleBar(self)
         main_layout.addWidget(self.title_bar)
 
-        # Wire web bridge for TypeScript/Web UI integration (QWebChannel)
+        # Wire web bridge for TypeScript/Web UI
         try:
             from gui.web_bridge import WebBridgeEngine
             self.web_engine = WebBridgeEngine()
+            self.web_engine.setParent(self)
         except Exception:
             pass
 
@@ -582,7 +583,7 @@ class MainWindow(QMainWindow):
                 grip.deleteLater()
             self._grips.clear()
         # Minimize to tray
-        if self.tray_icon and self.tray_icon.isVisible():
+        if getattr(self, 'tray_icon', None) and self.tray_icon.isVisible():
             event.ignore()
             self.hide()
             self.tray_icon.showMessage(

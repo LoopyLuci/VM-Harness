@@ -419,7 +419,7 @@ class SecurityPanel(QWidget):
 
         search_input = QLineEdit()
         search_input.setPlaceholderText("Search credentials...")
-        search_input.setFixedWidth(200)
+        search_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         search_input.setStyleSheet("""
             QLineEdit {
                 background: #0f172a;

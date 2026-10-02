@@ -139,7 +139,7 @@ class PairingPanel(QWidget):
         """)
         uri_row_layout.addWidget(self.uri_input)
         copy_btn = QPushButton("Copy")
-        copy_btn.setFixedWidth(60)
+        copy_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         copy_btn.setStyleSheet("""
             QPushButton {
                 background: #3b82f6;
@@ -262,10 +262,10 @@ class PairingPanel(QWidget):
         fed_uri_row_layout.setSpacing(8)
         fed_uri_label = QLabel("Remote URI:")
         fed_uri_label.setStyleSheet("color: #cbd5e1; font-size: 12px;")
-        fed_uri_label.setFixedWidth(70)
+        fed_uri_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         fed_uri_row_layout.addWidget(fed_uri_label)
         self.fed_uri_input = TextInput("vmharness://pair?key=...")
-        self.fed_uri_input.setFixedWidth(360)
+        self.fed_uri_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         fed_uri_row_layout.addWidget(self.fed_uri_input)
         fed_uri_row_layout.addStretch()
         add_card.content_layout.addWidget(fed_uri_row)
@@ -422,7 +422,7 @@ class PairingPanel(QWidget):
 
                 # Revoke button
                 revoke_btn = QPushButton("Revoke")
-                revoke_btn.setFixedWidth(60)
+                revoke_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
                 revoke_btn.setStyleSheet("""
                     QPushButton {
                         background: #ef4444;
@@ -559,7 +559,7 @@ class PairingPanel(QWidget):
 
                 # Remove button
                 remove_btn = QPushButton("Remove")
-                remove_btn.setFixedWidth(60)
+                remove_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
                 remove_btn.setStyleSheet("""
                     QPushButton {
                         background: #ef4444;
@@ -599,3 +599,23 @@ class PairingPanel(QWidget):
                 self._refresh_federation()
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to remove: {e}")
+
+
+class PairingManager:
+    """Simple pairing token manager for protocol server."""
+
+    def __init__(self):
+        self._tokens: dict = {}
+
+    def generate_token(self, device_id: str) -> str:
+        import secrets
+        token = secrets.token_urlsafe(32)
+        self._tokens[token] = {"device_id": device_id, "valid": True}
+        return token
+
+    def verify_token(self, device_id: str, token: str) -> dict:
+        if token in self._tokens:
+            stored = self._tokens[token]
+            if stored.get("device_id") == device_id:
+                return {"valid": True, "device_id": device_id, "token": token}
+        return {"valid": False}

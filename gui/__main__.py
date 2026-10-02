@@ -178,8 +178,26 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # Register atexit cleanup
-    atexit.register(_release_lock)
+    # Ensure .pyd can be loaded from frozen EXE — add _internal to Python path
+    _executable_dir = os.path.dirname(os.path.abspath(sys.executable) if getattr(sys, 'frozen', False) else __file__)
+    for _extra_path in (os.path.join(_executable_dir, "_internal"), os.path.join(_executable_dir, "..", "_internal"), "_internal"):
+        if os.path.isdir(_extra_path) and _extra_path not in sys.path:
+            sys.path.insert(0, _extra_path)
+
+    # Enable High-DPI rendering — MUST be before QApplication creation
+    try:
+        from PyQt5.QtCore import QtApplicationAttribute
+        QtApplicationAttribute.AA_EnableHighDpiScaling
+        Qt.setAttribute(QtApplicationAttribute.AA_EnableHighDpiScaling, True)
+        Qt.setAttribute(QtApplicationAttribute.AA_UseHighDpiPixmaps, True)
+    except Exception:
+        # Fallback for older PyQt5: direct enum value
+        try:
+            from PyQt5.QtCore import Qt
+            Qt.setAttribute(Qt.ApplicationAttribute.AA_EnableHighDpiScaling, True)  # type: ignore
+            Qt.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps, True)  # type: ignore
+        except Exception:
+            pass
 
     # Run GUI
     logger.info("Starting VM-Harness GUI")

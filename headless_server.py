@@ -124,6 +124,115 @@ class HeadlessServer(QMCMApiServer):
         app.router.add_get("/api/v1/security/audit", self._handle_audit)
         app.router.add_get("/api/v1/logs", self._handle_logs)
 
+        # ── Protobuf-compatible endpoint ─────────────────────────────────────────
+        # Accepts JSON-serialized protobuf messages and dispatches to VM lifecycle.
+        # Protocol version: 3.0.0
+        async def proto_handle(request):
+            try:
+                body = await request.json()
+            except:
+                return self._json({"error": "invalid_json", "protocol": "3.0.0"}, status=400)
+
+            msg_type = body.get("type", "").lower()
+            response = {"protocol": "3.0.0", "status": "ok"}
+
+            if msg_type == "vm_config":
+                try:
+                    from crates.protocol.src.proto_bindings import VmConfig
+                    config = VmConfig.from_dict(body.get("payload", {}))
+                    errors = config.validate()
+                    if errors:
+                        return self._json({"error": "; ".join(errors), "protocol": "3.0.0", "status": "validation_failed"}, status=400)
+                    vm_name = config.name or body.get("name", "")
+                    if vm_name:
+                        ok, msg = self._vm_manager.add_vm(vm_name, {
+                            'disk_path': config.disk_path,
+                            'ram_mb': config.memory_mb,
+                            'cpus': config.cpus,
+                            'display': config.display_type,
+                        })
+                        response["detail"] = msg
+                        response["status"] = "ok" if ok else "error"
+                    else:
+                        response["status"] = "error"
+                        response["detail"] = "missing_name"
+                except Exception as e:
+                    return self._json({"error": str(e), "protocol": "3.0.0", "status": "error"}, status=500)
+
+            elif msg_type == "vm_metrics":
+                vm_name = body.get("vm_name", "")
+                if vm_name:
+                    summary = self._vm_manager.get_summary(vm_name)
+                    response["metrics"] = {
+                        "vm_id": vm_name,
+                        "cpu_percent": summary.cpu_usage if summary else 0.0,
+                        "memory_used_mb": summary.ram_usage_mb if summary else 0,
+                        "memory_total_mb": summary.ram_mb if summary else 0,
+                        "disk_read_bytes": 0,
+                        "disk_write_bytes": 0,
+                        "net_rx_bytes": 0,
+                        "net_tx_bytes": 0,
+                        "uptime_seconds": summary.uptime_seconds if summary else 0,
+                    } if summary else None
+                    if not summary:
+                        response["status"] = "error"
+                        response["detail"] = "vm_not_found"
+                else:
+                    all_metrics = []
+                    for vm_name in self._vm_manager.list_vms():
+                        summary = self._vm_manager.get_summary(vm_name)
+                        if summary:
+                            all_metrics.append({
+                                "vm_id": vm_name,
+                                "cpu_percent": summary.cpu_usage,
+                                "memory_used_mb": summary.ram_usage_mb,
+                                "memory_total_mb": summary.ram_mb,
+                                "disk_read_bytes": 0,
+                                "disk_write_bytes": 0,
+                                "net_rx_bytes": 0,
+                                "net_tx_bytes": 0,
+                                "uptime_seconds": summary.uptime_seconds,
+                            })
+                    response["metrics"] = all_metrics
+
+            elif msg_type == "pairing_token":
+                device_id = body.get("device_id", "")
+                token = body.get("token", "")
+                from gui.panels_pairing import PairingManager
+                pm = PairingManager()
+                result = pm.verify_token(device_id, token)
+                response["pairing"] = result
+                response["status"] = "ok" if result.get("valid") else "invalid"
+
+            elif msg_type == "chat_message":
+                chat_content = body.get("payload", {}).get("content", "")
+                response["chat"] = {"content": chat_content, "protocol": "3.0.0"}
+                response["status"] = "ok"
+
+            elif msg_type == "audit_event":
+                audit_payload = body.get("payload", {})
+                audit_id = audit_payload.get("id", "")
+                audit_type = audit_payload.get("audit_type", "")
+                audit_source = audit_payload.get("source", "")
+                audit_ts = audit_payload.get("timestamp", "")
+                audit_user = audit_payload.get("user", "")
+                response["audit"] = {
+                    "id": audit_id,
+                    "audit_type": audit_type,
+                    "source": audit_source,
+                    "timestamp": audit_ts,
+                    "user": audit_user,
+                    "protocol": "3.0.0",
+                }
+                response["status"] = "ok"
+
+            else:
+                return self._json({"error": f"unknown_msg_type: {msg_type}", "protocol": "3.0.0", "status": "error"}, status=400)
+
+            return self._json(response)
+
+        app.router.add_post("/v1/proto", proto_handle)
+
         async def health(request):
             return web.json_response({"status": "ok"})
 

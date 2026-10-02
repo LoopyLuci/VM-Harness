@@ -28,7 +28,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
-from PyQt5.QtCore import QObject, pyqtSignal, Qt, QTimer
+from PyQt5.QtCore import QObject, pyqtSignal, Qt, QTimer, QSizePolicy
 from PyQt5.QtGui import QColor, QBrush, QFont
 from PyQt5.QtWidgets import (
     QWidget,
@@ -590,7 +590,7 @@ class AuditLogPanel(QWidget):
 
         self.user_input = QLineEdit()
         self.user_input.setPlaceholderText("Filter by user...")
-        self.user_input.setFixedWidth(120)
+        self.user_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.user_input.setStyleSheet("""
             QLineEdit {
                 background: #0f172a;
@@ -611,7 +611,7 @@ class AuditLogPanel(QWidget):
 
         self.ip_input = QLineEdit()
         self.ip_input.setPlaceholderText("Filter by IP...")
-        self.ip_input.setFixedWidth(120)
+        self.ip_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.ip_input.setStyleSheet("""
             QLineEdit {
                 background: #0f172a;
@@ -647,7 +647,7 @@ class AuditLogPanel(QWidget):
         # Search
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Search details...")
-        self.search_input.setFixedWidth(180)
+        self.search_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.search_input.setStyleSheet("""
             QLineEdit {
                 background: #0f172a;

@@ -54,12 +54,12 @@ class LogsPanel(QWidget):
         # Log source selector
         log_src_label = QLabel("Log Source:")
         log_src_label.setStyleSheet("color: #cbd5e1; font-size: 12px;")
-        log_src_label.setFixedWidth(80)
+        log_src_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         toolbar_layout.addWidget(log_src_label)
 
         self.log_source_combo = QComboBox()
         self.log_source_combo.addItems(["Application", "QMP", "SSH"])
-        self.log_source_combo.setFixedWidth(140)
+        self.log_source_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.log_source_combo.setStyleSheet("""
             QComboBox {
                 background: #0f172a;
@@ -85,7 +85,7 @@ class LogsPanel(QWidget):
             cb = QCheckBox(level)
             cb.setStyleSheet("color: #94a3b8; font-size: 11px;")
             cb.setChecked(True)
-            cb.setFixedWidth(60)
+            cb.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             self.level_filters[level] = cb
             toolbar_layout.addWidget(cb)
 

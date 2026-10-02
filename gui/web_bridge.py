@@ -68,7 +68,13 @@ class WebBridgeEngine(QWebEngineView):
 
         # Load the compiled web build
         import os
-        web_dir = os.path.join(os.path.dirname(__file__), "..", "..", "web", "dist")
+        import sys
+        # When running from PyInstaller frozen EXE, resources are in sys._MEIPASS
+        if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+            web_dir = os.path.join(sys._MEIPASS, 'web', 'dist')
+        else:
+            # Running from source: one level up from gui/ → project root
+            web_dir = os.path.join(os.path.dirname(__file__), "..", "web", "dist")
         if not os.path.exists(web_dir):
             web_dir = os.path.join(os.path.dirname(__file__), "..", "..", "web")
         index_path = os.path.join(web_dir, "index.html")

@@ -158,7 +158,7 @@ class Toast(QFrame):
         self._hide_timer.timeout.connect(self.hide)
         self.setFrameStyle(QFrame.StyledPanel | QFrame.Plain)
         self.setStyleSheet("background: #1e293b; border-radius: 8px; padding: 12px 16px;")
-        self.setFixedWidth(320)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._build_ui()
         self.show()
         self._fade_timer.start(duration)
@@ -432,7 +432,7 @@ class Card(QFrame):
 
         lbl = QLabel(label)
         lbl.setStyleSheet(f"color: {T.TEXT_SECONDARY}; font-size: {T.FS_MD}px;")
-        lbl.setFixedWidth(120)
+        lbl.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         if tooltip:
             lbl.setToolTip(tooltip)
         row_layout.addWidget(lbl)
@@ -757,7 +757,7 @@ class LogEntry(QFrame):
             f"font-size: {T.FS_SM}px;"
             "font-family: monospace;"
         )
-        ts_l.setFixedWidth(80)
+        ts_l.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         layout.addWidget(ts_l)
 
         level_l = QLabel(level)
@@ -766,7 +766,7 @@ class LogEntry(QFrame):
             f"font-size: {T.FS_SM}px;"
             "font-weight: bold;"
         )
-        level_l.setFixedWidth(60)
+        level_l.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         layout.addWidget(level_l)
 
         msg_l = QLabel(message)

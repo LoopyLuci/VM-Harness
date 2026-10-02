@@ -201,7 +201,7 @@ class VMControlPanel(QWidget):
             col = (i % 3) * 2
             lbl = QLabel(field_name)
             lbl.setStyleSheet(f"color: {T.TEXT_MUTED}; font-size: 11px;")
-            lbl.setFixedWidth(70)
+            lbl.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
             config_grid.addWidget(lbl, row, col)
 
             val = QLabel("—")

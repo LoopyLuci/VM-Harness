@@ -198,7 +198,7 @@ class ChatPanel(QWidget):
         hl.addWidget(title)
         hl.addStretch()
         self._provider_combo = QComboBox()
-        self._provider_combo.setFixedWidth(150)
+        self._provider_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._provider_combo.setStyleSheet(
             "QComboBox { background: " + T.BG_SECONDARY + "; color: " + T.TEXT_PRIMARY + ";"
             " border: 1px solid " + T.BG_TERTIARY + "; border-radius: 4px; padding: 4px; }"

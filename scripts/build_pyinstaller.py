@@ -285,6 +285,7 @@ def main():
         Path(r"C:\Users\Server\AppData\Local\Programs\Python\Python311\python311.dll"),
     ]
     python_dll: Path | None = None
+    # Ensure .pyd binary embedded for frozen EXE loader
     for candidate in dll_sources:
         if candidate.exists():
             python_dll = candidate
@@ -296,6 +297,10 @@ def main():
     binaries: list[tuple[Path, Path]] = []
     if python_dll is not None:
         binaries.append((python_dll, Path(".")))
+    # Rust supervisor .pyd - must be embedded in frozen EXE
+    pyd_src = PROJECT / "target/release/vmharness_supervisor.pyd"
+    if pyd_src.exists():
+        binaries.append((pyd_src, Path("_internal") / "vmharness_supervisor.pyd"))
     qt_plugins: list[tuple[Path, Path]] = []
     try:
         from PyQt5.QtCore import QLibraryInfo
