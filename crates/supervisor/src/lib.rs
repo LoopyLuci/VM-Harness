@@ -23,7 +23,7 @@ impl QemuSupervisor {
         let mut s = self.state.lock().map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("state lock"))?;
         let mut pid_opt = self.pid.lock().map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("pid lock"))?;
         *s = "running".to_string();
-        *pid_opt = Some(99999);
+        *pid_opt = None;
         Ok("started".to_string())
     }
 
@@ -34,6 +34,18 @@ impl QemuSupervisor {
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         *s = "stopped".to_string();
         Ok("stopped".to_string())
+    }
+
+    fn info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let dict = PyDict::new(py);
+        dict.set_item("name", &self.name)?;
+        let state = self.state.lock().map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("state lock"))?;
+        dict.set_item("state", state.clone())?;
+        let pid = self.pid.lock().map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("pid lock"))?;
+        if let Some(p) = *pid {
+            dict.set_item("pid", p)?;
+        }
+        Ok(dict)
     }
 
     fn state<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
