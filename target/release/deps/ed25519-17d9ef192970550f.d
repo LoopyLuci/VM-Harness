@@ -1,9 +1,0 @@
-C:\Projects\QEMU-MCP\target\release\deps\ed25519-17d9ef192970550f.d: C:\Users\Server\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ed25519-2.2.3\src\lib.rs C:\Users\Server\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ed25519-2.2.3\src\hex.rs C:\Users\Server\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ed25519-2.2.3\src\../README.md
-
-C:\Projects\QEMU-MCP\target\release\deps\libed25519-17d9ef192970550f.rlib: C:\Users\Server\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ed25519-2.2.3\src\lib.rs C:\Users\Server\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ed25519-2.2.3\src\hex.rs C:\Users\Server\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ed25519-2.2.3\src\../README.md
-
-C:\Projects\QEMU-MCP\target\release\deps\libed25519-17d9ef192970550f.rmeta: C:\Users\Server\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ed25519-2.2.3\src\lib.rs C:\Users\Server\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ed25519-2.2.3\src\hex.rs C:\Users\Server\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ed25519-2.2.3\src\../README.md
-
-C:\Users\Server\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ed25519-2.2.3\src\lib.rs:
-C:\Users\Server\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ed25519-2.2.3\src\hex.rs:
-C:\Users\Server\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ed25519-2.2.3\src\../README.md:

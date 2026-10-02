@@ -98,3 +98,9 @@ android/local.properties
 ci/artifacts/desktop/*.exe
 ci/artifacts/desktop/*.zip
 ci/artifacts/desktop/*.sha256
+
+# Build output and runtime state (never commit)
+target/
+
+# Node dependencies (restore with `npm ci` in web/)
+web/node_modules/
