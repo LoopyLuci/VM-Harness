@@ -1,0 +1,15 @@
+syntax = "proto3";
+package vmharness.v1;
+
+message VmMetrics {
+    string vm_id = 1;
+    double cpu_percent = 2;
+    uint64 memory_used_mb = 3;
+    uint64 memory_total_mb = 4;
+    uint64 disk_read_bytes = 5;
+    uint64 disk_write_bytes = 6;
+    uint64 net_rx_bytes = 7;
+    uint64 net_tx_bytes = 8;
+    uint64 uptime_seconds = 9;
+    uint64 timestamp_unix_nanos = 10;
+}

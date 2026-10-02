@@ -1,0 +1,44 @@
+syntax = "proto3";
+package vmharness.v1;
+
+message PairingToken {
+    string device_id = 1;
+    string token = 2;
+    string status = 3;  // pending, paired, expired, revoked
+    string expires_at = 4;  // ISO8601 timestamp
+}
+
+service Pairing {
+    rpc GenerateToken(GenerateTokenRequest) returns (GenerateTokenResponse);
+    rpc VerifyToken(VerifyTokenRequest) returns (VerifyTokenResponse);
+    rpc RevokeToken(RevokeTokenRequest) returns (RevokeTokenResponse);
+}
+
+message GenerateTokenRequest {
+    string device_name = 1;
+}
+
+message GenerateTokenResponse {
+    string token = 1;
+    string device_id = 2;
+    bool success = 3;
+}
+
+message VerifyTokenRequest {
+    string token = 1;
+    string device_id = 2;
+}
+
+message VerifyTokenResponse {
+    bool valid = 1;
+    string status = 2;
+    string message = 3;
+}
+
+message RevokeTokenRequest {
+    string token = 1;
+}
+
+message RevokeTokenResponse {
+    bool success = 1;
+}

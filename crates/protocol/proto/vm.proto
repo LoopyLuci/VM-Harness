@@ -1,0 +1,44 @@
+syntax = "proto3";
+package vmharness.v1;
+
+message VmConfig {
+    string vm_id = 1;
+    string name = 2;
+    uint32 memory_mb = 3;
+    uint32 cpus = 4;
+    string disk_path = 5;
+    string disk_format = 6;  // Qcow2=1, Raw=2, Vmdk=3, Vdi=4
+    string network_mode = 7;  // Nat=1, Bridge=2, User=3, None=4
+    string display_type = 8;  // Sdl=1, Vnc=2, Spice=3, Gtk=4, None=5
+    bool enable_kvm = 9;
+    string qmp_addr = 10;
+    uint32 ssh_port = 11;
+    repeated string extra_args = 12;
+    repeated string tags = 13;
+    string iso_path = 14;
+}
+
+enum DiskFormat {
+    DISK_FORMAT_UNSPECIFIED = 0;
+    QCOW2 = 1;
+    RAW = 2;
+    VMDK = 3;
+    VDI = 4;
+}
+
+enum NetworkMode {
+    NETWORK_MODE_UNSPECIFIED = 0;
+    NAT = 1;
+    BRIDGE = 2;
+    USER = 3;
+    NONE = 4;
+}
+
+enum DisplayType {
+    DISPLAY_TYPE_UNSPECIFIED = 0;
+    SDL = 1;
+    VNC = 2;
+    SPICE = 3;
+    GTK = 4;
+    NONE = 5;
+}

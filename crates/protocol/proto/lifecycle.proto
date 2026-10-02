@@ -1,0 +1,67 @@
+syntax = "proto3";
+package vmharness.v1;
+
+service VmLifecycle {
+    rpc StartVm(StartVmRequest) returns (StartVmResponse);
+    rpc StopVm(StopVmRequest) returns (StopVmResponse);
+    rpc ResetVm(ResetVmRequest) returns (ResetVmResponse);
+    rpc PauseVm(PauseVmRequest) returns (PauseVmResponse);
+    rpc ResumeVm(ResumeVmRequest) returns (ResumeVmResponse);
+    rpc StreamMetrics(StreamMetricsRequest) returns (stream VmMetrics);
+}
+
+message StartVmRequest {
+    string vm_id = 1;
+    bool boot_iso = 2;
+    string iso_path = 3;
+}
+
+message StartVmResponse {
+    string vm_id = 1;
+    uint32 pid = 2;
+    string qmp_addr = 3;
+    bool success = 4;
+}
+
+message StopVmRequest {
+    string vm_id = 1;
+    bool force = 2;
+}
+
+message StopVmResponse {
+    string vm_id = 1;
+    bool success = 2;
+    string message = 3;
+}
+
+message ResetVmRequest {
+    string vm_id = 1;
+}
+
+message ResetVmResponse {
+    string vm_id = 1;
+    bool success = 2;
+}
+
+message PauseVmRequest {
+    string vm_id = 1;
+}
+
+message PauseVmResponse {
+    string vm_id = 1;
+    bool success = 2;
+}
+
+message ResumeVmRequest {
+    string vm_id = 1;
+}
+
+message ResumeVmResponse {
+    string vm_id = 1;
+    bool success = 2;
+}
+
+message StreamMetricsRequest {
+    string vm_id = 1;
+    uint32 interval_ms = 2;
+}

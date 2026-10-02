@@ -1,0 +1,4 @@
+[package]
+name = "vmharness-crypto"
+version.workspace = true
+edition = "2024"

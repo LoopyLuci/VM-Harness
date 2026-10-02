@@ -1,0 +1,4 @@
+[package]
+name = "vmharness-protocol"
+version.workspace = true
+edition = "2024"
