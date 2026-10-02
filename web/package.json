@@ -8,10 +8,10 @@
     "dev": "webpack serve --mode development",
     "typecheck": "tsc --noEmit"
   },
-  "dependencies": {},
   "devDependencies": {
+    "ts-loader": "^9.5",
     "typescript": "~5.4",
     "webpack": "^5.90",
-    "ts-loader": "^9.5"
+    "webpack-cli": "^7.2.3"
   }
 }
