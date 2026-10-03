@@ -81,6 +81,54 @@ The `vm.*`, `iso.*`, `container.*` and `host.*` names are operation IDs, not sub
 `vm.start`, `vm.stop`, `vm.snapshot.create`, `iso.list`, `container.list`, `host.capabilities`, and about 160 more.
 `vm-harness ops` lists them all with a summary; `docs/control.md` documents them.
 
+## Talking to a guest
+
+The harness could start, stop and inspect a VM but had no way to *talk* to one, so every question a
+guest could only answer by drawing to its console — a login prompt, a confirmation, an installer
+dialog — was unaskable once its serial log went quiet.
+
+```bash
+vm-harness call guest.type        qmp_uri=tcp:127.0.0.1:4444 text=hello submit=true
+vm-harness call guest.press       qmp_uri=tcp:127.0.0.1:4444 key=backspace times=40
+vm-harness call guest.screendump  qmp_uri=tcp:127.0.0.1:4444 path=vm/console.ppm
+```
+
+Keystrokes go through QMP's `human-monitor-command` passthrough to the guest's PS/2 keyboard, so no
+extra device is needed on the VM's command line. They are sent one at a time with a delay, because
+guests drop input that arrives faster than they poll the keyboard.
+
+Every unencodable character raises rather than being skipped. A password typed with one character
+missing produces no error — just a login that fails for an invisible reason — so a loud failure at
+type time is much cheaper. The keymap covers all 95 printable ASCII characters on a US layout and is
+the place to extend for other layouts.
+
+**Console credentials.** *VM Control → Connect to QMP → Console Login…* stores the username and
+password a VM's login prompt expects. They go into the same encrypted `CredentialStore` as every
+other secret (Fernet, `0600`), and the dialog will not echo a stored password back.
+
+Signing in unattended:
+
+```python
+from vm_harness.autologin import ConsoleLogin, login
+from vm_harness.qmp_client import QMPClient
+from gui.dialogs_vm_login import load_vm_login
+
+creds = load_vm_login()          # (username, password), or None
+async with QMPClient("tcp:127.0.0.1:4444") as client:
+    print(await login(client, ConsoleLogin(*creds)))
+```
+
+`login()` reports a before/after screendump and whether the screen changed, rather than assuming the
+keystrokes landed. An unchanged screen means the login prompt simply redrew itself, i.e. it failed.
+
+Two deliberate constraints. The store derives its key from `GUI_MASTER_PASSWORD` when set, otherwise
+from a random `.master_key` file beside the credentials — the second mode is what allows unattended
+use at all, but it means the key is on the same disk as the data, so it protects against the
+credentials file leaking alone rather than against someone who already has the account. And
+`login()` takes the credentials as arguments rather than reading the store itself, because ops are
+dispatched, logged and exposed over MCP and HTTP, and a password should not be riding along in an
+argument dict.
+
 ## Phone API (the Android app)
 
 The window serves the Android companion app on port 8443. Phones pair once, then call it over Tailscale with their key.

@@ -276,6 +276,71 @@ def _add_host_ops(cat: Catalog, engine: Engine) -> None:
         }
         return payload
 
+    @cat.op("guest.type", group="guest", mutating=True)
+    async def guest_type(qmp_uri: str, text: str, key_delay_sec: float = 0.05,
+                         submit: bool = False) -> dict:
+        """Type text into a running guest's console
+
+        Reaches an interactive guest -- a login prompt, a confirmation, an
+        installer question -- which is otherwise unreachable once its serial
+        log goes quiet. Goes through the guest's PS/2 keyboard, so no extra
+        device is needed on the VM's command line.
+
+        Typing is character-by-character with a delay, because guests drop
+        input that arrives faster than they poll the keyboard. `submit` sends
+        Return afterwards. Verify with guest.screendump: there is no way to
+        read what the guest drew, so assume nothing landed until you look."""
+        from vm_harness.guest_input import GuestKeyboard
+        from vm_harness.qmp_client import QMPClient
+
+        client = QMPClient(qmp_uri)
+        await client.connect()
+        try:
+            keyboard = GuestKeyboard(client, key_delay_sec=key_delay_sec)
+            await keyboard.type_text(text)
+            if submit:
+                await keyboard.press("ret")
+            return {"typed": len(text), "submitted": bool(submit)}
+        finally:
+            await client.disconnect()
+
+    @cat.op("guest.press", group="guest", mutating=True)
+    async def guest_press(qmp_uri: str, key: str, times: int = 1,
+                          key_delay_sec: float = 0.05) -> dict:
+        """Press a named key in a guest: ret, tab, esc, backspace, up, home
+
+        For clearing a field that already has text in it, or answering a
+        prompt the guest is stuck on."""
+        from vm_harness.guest_input import GuestKeyboard
+        from vm_harness.qmp_client import QMPClient
+
+        client = QMPClient(qmp_uri)
+        await client.connect()
+        try:
+            keyboard = GuestKeyboard(client, key_delay_sec=key_delay_sec)
+            await keyboard.press(key, times=times)
+            return {"key": key, "times": times}
+        finally:
+            await client.disconnect()
+
+    @cat.op("guest.screendump", group="guest")
+    async def guest_screendump(qmp_uri: str, path: str) -> dict:
+        """Photograph what the guest is drawing right now
+
+        The only way to see a guest that draws to a TTY: a graphical console
+        has no serial equivalent, and an installer's progress text never
+        reaches the log. Writes a PPM; convert with Pillow to view it."""
+        from vm_harness.guest_input import screendump
+        from vm_harness.qmp_client import QMPClient
+
+        client = QMPClient(qmp_uri)
+        await client.connect()
+        try:
+            written = await screendump(client, path)
+            return {"path": str(written), "bytes": written.stat().st_size}
+        finally:
+            await client.disconnect()
+
     @cat.op("cloudinit.backends", group="cloudinit")
     async def seed_backends() -> dict:
         """Which NoCloud seed builders this host can use"""

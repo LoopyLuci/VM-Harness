@@ -134,6 +134,22 @@ class VMControlPanel(QWidget):
         conn_row_layout.addWidget(self.conn_info)
         conn_row_layout.addStretch()
 
+        # Console login credentials. Sits next to the QMP connection because
+        # using them needs one: keystrokes reach the guest over QMP.
+        self.console_login_btn = QPushButton("Console Login…")
+        self.console_login_btn.setFixedHeight(32)
+        self.console_login_btn.setCursor(Qt.PointingHandCursor)
+        self.console_login_btn.setToolTip(
+            "Save the username and password used to sign in to this VM's console"
+        )
+        self.console_login_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; color: {T.TEXT_SECONDARY};"
+            f" border: 1px solid {T.BG_TERTIARY}; border-radius: 4px;"
+            f" font-size: 12px; padding: 0 16px; }}"
+            f"QPushButton:hover {{ color: {T.TEXT_PRIMARY}; }}"
+        )
+        conn_row_layout.addWidget(self.console_login_btn)
+
         self.connect_btn = QPushButton("Connect to QMP")
         self.connect_btn.setFixedHeight(32)
         self.connect_btn.setStyleSheet(
@@ -230,6 +246,7 @@ class VMControlPanel(QWidget):
 
         # ── Wire buttons ───────────────────────────────────────────────────────
         self.connect_btn.clicked.connect(self._on_connect)
+        self.console_login_btn.clicked.connect(self._on_console_login)
         self._lifecycle_btns["Start"].clicked.connect(self._on_start)
         self._lifecycle_btns["Stop"].clicked.connect(self._on_stop)
         self._lifecycle_btns["Reset"].clicked.connect(self._on_reset)
@@ -241,6 +258,16 @@ class VMControlPanel(QWidget):
         self._pulse_timer = QTimer(self)
         self._pulse_timer.timeout.connect(self._pulse_connection)
         self._pulse_timer.start(5000)
+
+    def _on_console_login(self) -> None:
+        """Open the dialog that stores this VM's console credentials."""
+        from gui.dialogs_vm_login import VMLoginCredentialsDialog
+
+        dialog = VMLoginCredentialsDialog(self)
+        if dialog.exec_() and hasattr(self, "info_label"):
+            self.info_label.setText(
+                "Console login credentials saved. Keystrokes can now be sent to this VM."
+            )
 
     def set_multi_qmp_bridge(self, bridge: MultiVMQMPBridge) -> None:
         """Set the multi-VM QMP bridge."""

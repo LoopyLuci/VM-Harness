@@ -60,6 +60,7 @@ _MODULES_TO_RESET = [
     "gui.api_providers",    # API providers
     "gui.provider_store",   # provider store
     "gui.credential_store", # credential store (no module-level singleton, but reset anyway)
+    "gui.dialogs_vm_login", # VM console login dialog + its save/load helpers
     "gui.qmp_extractor",    # QMP command extractor
     # NOTE: gui.vm_cloner is intentionally excluded — it defines
     # TemplateMetadata as a @dataclass that tests use with isinstance().

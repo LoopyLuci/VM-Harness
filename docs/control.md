@@ -51,6 +51,7 @@ backends' own methods, so a backend method never lacks an operation (a test chec
 | `k8s.*` | contexts, namespaces, pods, deployments, services, ingresses, config maps, secrets, manifests, exec, logs, scale |
 | `iso.*` | list, download (with SHA-256 check), import, delete |
 | `host.*` | this machine, which backends work here (and why the others do not), backend settings |
+| `guest.*` | talk to a running guest: type text into its console, press a named key, screendump what it is drawing |
 | `audit.*` | the log, and a check that it has not been edited |
 | `gui.*` | the window (below) |
 | `service.*` | the hub itself |
