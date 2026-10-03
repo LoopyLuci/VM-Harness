@@ -49,7 +49,7 @@ def isolated_store(tmp_path, monkeypatch):
 def dialog(qtbot, isolated_store):
     from gui.dialogs_vm_login import VMLoginCredentialsDialog
 
-    widget = VMLoginCredentialsDialog()
+    widget = VMLoginCredentialsDialog(vm_name="omarchy-vm")
     qtbot.addWidget(widget)
     return widget
 
@@ -66,22 +66,22 @@ class TestSaveAndLoad:
     def test_round_trip(self, isolated_store):
         from gui.dialogs_vm_login import load_vm_login, save_vm_login
 
-        assert load_vm_login() is None
-        save_vm_login("omarchy-vm", "S3cret!Pass#2026")
-        assert load_vm_login() == ("omarchy-vm", "S3cret!Pass#2026")
+        assert load_vm_login("omarchy-vm") is None
+        save_vm_login("omarchy-vm", "someuser", "S3cret!Pass#2026")
+        assert load_vm_login("omarchy-vm") == ("someuser", "S3cret!Pass#2026")
 
     def test_resaving_updates_the_password(self, isolated_store):
         """The regression: a changed password must replace the old one."""
         from gui.dialogs_vm_login import load_vm_login, save_vm_login
 
-        save_vm_login("omarchy-vm", "first-password")
-        save_vm_login("omarchy-vm", "second-password")
-        assert load_vm_login() == ("omarchy-vm", "second-password")
+        save_vm_login("omarchy-vm", "someuser", "first-password")
+        save_vm_login("omarchy-vm", "someuser", "second-password")
+        assert load_vm_login("omarchy-vm") == ("someuser", "second-password")
 
     def test_password_is_encrypted_at_rest(self, isolated_store):
         from gui.dialogs_vm_login import save_vm_login
 
-        save_vm_login("omarchy-vm", "PlaintextCanary123!")
+        save_vm_login("omarchy-vm", "someuser", "PlaintextCanary123!")
         raw = next(isolated_store.rglob("credentials.json")).read_text()
         assert "PlaintextCanary123!" not in raw
         assert json.loads(raw)["credentials"]
@@ -89,37 +89,37 @@ class TestSaveAndLoad:
     def test_status_never_leaks_the_password(self, isolated_store):
         from gui.dialogs_vm_login import save_vm_login, vm_login_status
 
-        save_vm_login("omarchy-vm", "PlaintextCanary123!")
-        status = vm_login_status()
+        save_vm_login("omarchy-vm", "someuser", "PlaintextCanary123!")
+        status = vm_login_status("omarchy-vm")
         assert "PlaintextCanary123!" not in status
-        assert "omarchy-vm" in status
+        assert "omarchy-vm" in status and "someuser" in status
 
     def test_empty_store_reports_not_set(self, isolated_store):
         from gui.dialogs_vm_login import vm_login_status
 
-        assert vm_login_status() == "(not set)"
+        assert vm_login_status("omarchy-vm").startswith("Not saved")
 
     def test_corrupt_payload_raises_instead_of_returning_garbage(self, isolated_store):
         from gui.credential_store import CredentialStore
-        from gui.dialogs_vm_login import VM_LOGIN_CREDENTIAL, load_vm_login
+        from gui.dialogs_vm_login import credential_name, load_vm_login
 
         store = CredentialStore()
-        store.add(VM_LOGIN_CREDENTIAL, "password", "not json at all", "")
+        store.add(credential_name("omarchy-vm"), "password", "not json at all", "")
         with pytest.raises(RuntimeError, match="malformed"):
-            load_vm_login()
+            load_vm_login("omarchy-vm")
 
 
 class TestDialog:
     def test_constructs(self, dialog):
-        assert dialog.windowTitle() == "VM Console Login"
+        assert dialog.windowTitle().startswith("Login") and "omarchy-vm" in dialog.windowTitle()
 
     def test_password_is_not_prefilled(self, isolated_store):
         """Echoing a stored secret back into a visible field undoes the point."""
         from gui.dialogs_vm_login import VMLoginCredentialsDialog, save_vm_login
 
-        save_vm_login("omarchy-vm", "stored-secret")
-        reopened = VMLoginCredentialsDialog()
-        assert reopened.username_input.text() == "omarchy-vm"
+        save_vm_login("omarchy-vm", "someuser", "stored-secret")
+        reopened = VMLoginCredentialsDialog(vm_name="omarchy-vm")
+        assert reopened.username_input.text() == "someuser"
         assert reopened.password_input.text() == ""
 
     def test_mismatched_confirmation_is_not_saved(self, dialog, isolated_store, no_popups):
@@ -129,7 +129,7 @@ class TestDialog:
         dialog.password_input.setText("one")
         dialog.confirm_input.setText("two")
         dialog._save()
-        assert load_vm_login() is None
+        assert load_vm_login("omarchy-vm") is None
 
     def test_valid_save_persists(self, dialog, isolated_store, no_popups):
         from gui.dialogs_vm_login import VMLoginCredentialsDialog, load_vm_login
@@ -138,8 +138,8 @@ class TestDialog:
         dialog.password_input.setText("pw-123")
         dialog.confirm_input.setText("pw-123")
         dialog._save()
-        assert load_vm_login() == ("omarchy-vm", "pw-123")
-        assert VMLoginCredentialsDialog().username_input.text() == "omarchy-vm"
+        assert load_vm_login("omarchy-vm") == ("omarchy-vm", "pw-123")
+        assert VMLoginCredentialsDialog(vm_name="omarchy-vm").username_input.text() == "omarchy-vm"
 
     def test_username_is_required(self, dialog, isolated_store, no_popups):
         from gui.dialogs_vm_login import load_vm_login
@@ -148,38 +148,72 @@ class TestDialog:
         dialog.password_input.setText("pw")
         dialog.confirm_input.setText("pw")
         dialog._save()
-        assert load_vm_login() is None
+        assert load_vm_login("omarchy-vm") is None
 
 
 class TestPanelWiring:
-    def test_vm_control_panel_exposes_the_dialog(self, qtbot, isolated_store):
-        """The button is the only way a user reaches this from the GUI."""
-        from gui.dialogs_vm_login import VMLoginCredentialsDialog
+    def test_button_names_the_selected_vm(self, qtbot, isolated_store):
+        """The caption says whose login it manages, not a generic "Console Login"."""
         from gui.panels_vm_control import VMControlPanel
 
         panel = VMControlPanel()
         qtbot.addWidget(panel)
-        assert panel.console_login_btn.text().startswith("Console Login")
+        assert panel.console_login_btn.text().startswith("Login")
 
-        opened: list[object] = []
+        panel._active_vm = "omarchy-vm"
+        panel._refresh_credential_summary()
+        assert "omarchy-vm" in panel.console_login_btn.text()
+
+    def test_dialog_receives_the_selected_vm(self, qtbot, isolated_store, monkeypatch):
+        """The dialog must be told which VM it is collecting credentials for.
+
+        With no VM selected the handler opens a modal QMessageBox, which blocks
+        forever under the offscreen platform, so the VM has to be set first.
+        """
+        from gui.panels_vm_control import VMControlPanel
         import gui.dialogs_vm_login as module
 
+        panel = VMControlPanel()
+        qtbot.addWidget(panel)
+        panel._active_vm = "omarchy-vm"
+
+        seen: dict[str, object] = {}
         original = module.VMLoginCredentialsDialog
 
         class _Spy(original):
-            def __init__(self, parent=None):
-                super().__init__(parent)
-                opened.append(self)
+            def __init__(self, vm_name="", **kwargs):
+                seen["vm_name"] = vm_name
+                super().__init__(vm_name=vm_name, **kwargs)
 
             def exec_(self):
                 return 0  # cancel immediately
 
-        module.VMLoginCredentialsDialog = _Spy
-        try:
-            panel._on_console_login()
-        finally:
-            module.VMLoginCredentialsDialog = original
-        assert len(opened) == 1
+        monkeypatch.setattr(module, "VMLoginCredentialsDialog", _Spy)
+        panel._on_console_login()
+        assert seen["vm_name"] == "omarchy-vm"
+
+    def test_no_vm_selected_does_not_open_the_dialog(self, qtbot, isolated_store, monkeypatch):
+        """Credentials are per VM; with none selected there is nothing to ask for."""
+        from gui.panels_vm_control import VMControlPanel
+        import gui.dialogs_vm_login as module
+
+        panel = VMControlPanel()
+        qtbot.addWidget(panel)
+        panel._active_vm = None
+
+        opened: list[object] = []
+        original = module.VMLoginCredentialsDialog
+
+        class _Never(original):
+            def __init__(self, *a, **k):
+                opened.append(self)
+                super().__init__(*a, **k)
+
+        monkeypatch.setattr(module, "VMLoginCredentialsDialog", _Never)
+        # The warning is modal; replace it so it cannot block the test run.
+        monkeypatch.setattr("gui.panels_vm_control.QMessageBox.information", lambda *a, **k: None)
+        panel._on_console_login()
+        assert opened == []
 
 
 class TestAutologin:

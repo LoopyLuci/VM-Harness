@@ -19,6 +19,7 @@ from PyQt5.QtWidgets import (
     QComboBox,
     QGridLayout,
     QProgressBar,
+    QMessageBox,
     QSpinBox,
     QCheckBox,
     QSizePolicy,
@@ -44,6 +45,7 @@ class VMControlPanel(QWidget):
         self._multi_qmp: MultiVMQMPBridge | None = None
         self._manager: MultiVMManager | None = None
         self._active_vm: str | None = None
+        self._bridge_error: str = ""
         self.setStyleSheet("background: " + T.BG_PRIMARY + ";")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
@@ -136,11 +138,11 @@ class VMControlPanel(QWidget):
 
         # Console login credentials. Sits next to the QMP connection because
         # using them needs one: keystrokes reach the guest over QMP.
-        self.console_login_btn = QPushButton("Console Login…")
+        self.console_login_btn = QPushButton("Login…")
         self.console_login_btn.setFixedHeight(32)
         self.console_login_btn.setCursor(Qt.PointingHandCursor)
         self.console_login_btn.setToolTip(
-            "Save the username and password used to sign in to this VM's console"
+            "Select a VM to store its Username and Password"
         )
         self.console_login_btn.setStyleSheet(
             f"QPushButton {{ background: transparent; color: {T.TEXT_SECONDARY};"
@@ -260,13 +262,49 @@ class VMControlPanel(QWidget):
         self._pulse_timer.start(5000)
 
     def _on_console_login(self) -> None:
-        """Open the dialog that stores this VM's console credentials."""
+        """Open the dialog that stores this VM's Username and Password.
+
+        Passes the VM explicitly. The dialog used to be parented to the panel
+        and asked for a generic "Console username" without saying which machine
+        it was for, and stored one global pair shared by every VM.
+        """
         from gui.dialogs_vm_login import VMLoginCredentialsDialog
 
-        dialog = VMLoginCredentialsDialog(self)
-        if dialog.exec_() and hasattr(self, "info_label"):
+        if not self._active_vm:
+            QMessageBox.information(
+                self, "No VM Selected",
+                "Select a VM in the VM Switcher first — these credentials are "
+                "stored per VM.",
+            )
+            return
+
+        config = self._manager.get_vm(self._active_vm) if self._manager else None
+        dialog = VMLoginCredentialsDialog(
+            vm_name=self._active_vm,
+            config=config,
+            status=self._manager.get_status(self._active_vm) if self._manager else "",
+            qmp_uri=(self._manager.get_qmp_uri(self._active_vm) or "") if self._manager else "",
+            ssh_uri=(self._manager.get_ssh_uri(self._active_vm) or "") if self._manager else "",
+            parent=self,
+        )
+        if dialog.exec_():
+            self._refresh_credential_summary()
+
+    def _refresh_credential_summary(self) -> None:
+        """Keep the button caption telling the user whose login it manages."""
+        from gui.dialogs_vm_login import vm_login_status
+
+        if not hasattr(self, "console_login_btn"):
+            return
+        if not self._active_vm:
+            self.console_login_btn.setText("Login…")
+            self.console_login_btn.setToolTip("Select a VM to store its login credentials")
+            return
+        self.console_login_btn.setText(f"Login: {self._active_vm}")
+        self.console_login_btn.setToolTip(vm_login_status(self._active_vm))
+        if hasattr(self, "info_label"):
             self.info_label.setText(
-                "Console login credentials saved. Keystrokes can now be sent to this VM."
+                f"{self._active_vm}: {vm_login_status(self._active_vm)}"
             )
 
     def set_multi_qmp_bridge(self, bridge: MultiVMQMPBridge) -> None:
@@ -285,12 +323,36 @@ class VMControlPanel(QWidget):
         """Switch the control panel context to a specific VM."""
         self._active_vm = vm_name
 
-        if self._multi_qmp:
-            self._multi_qmp.switch_to_vm(vm_name)
+        # Build the bridge for this VM from the shared manager. MultiVMQMPBridge
+        # is constructed per VM (it takes a name and a QMP URI), so there is no
+        # single instance to hand around -- previously the panel was given a
+        # single-VM QMPBridge that had none of the methods called here.
+        self._rebuild_bridge(vm_name)
 
         self._update_context_display()
         self._update_config_display()
         self._update_button_states()
+        self._refresh_credential_summary()
+
+    def _rebuild_bridge(self, vm_name: str) -> None:
+        from gui.multi_vm_qmp_bridge import MultiVMQMPBridge
+
+        if self._multi_qmp:
+            try:
+                self._multi_qmp.stop()
+            except Exception:  # noqa: BLE001 - a stale bridge must not block switching
+                pass
+            self._multi_qmp = None
+
+        if not self._manager:
+            return
+        uri = self._manager.get_qmp_uri(vm_name)
+        if not uri:
+            return
+        try:
+            self._multi_qmp = MultiVMQMPBridge(vm_name, uri)
+        except Exception as exc:  # noqa: BLE001
+            self._bridge_error = str(exc)
 
     def _update_context_display(self):
         """Update the context header with current VM info."""

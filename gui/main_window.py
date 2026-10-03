@@ -415,6 +415,10 @@ class MainWindow(QMainWindow):
         # ── QMP Bridge (background async → PyQt5 signals) ─────────────────────
         from gui.qmp_bridge import QMPBridge
         self.qmp_bridge = QMPBridge(settings=self.settings)
+        # Shared MultiVMManager and the VM the sidebar has selected. Populated
+        # once the panels exist; declared here so the attributes always exist.
+        self.vm_manager = None
+        self.active_vm_name: str | None = None
         self.qmp_bridge.start()
         self.qmp_bridge.connected.connect(self._on_qmp_connected)
         self.qmp_bridge.vm_status.connect(self._on_vm_status)
@@ -704,8 +708,23 @@ class MainWindow(QMainWindow):
         # ── Wire bridges to panels ────────────────────────────────────────────
         if "dashboard" in self.panels:
             self.panels["dashboard"].set_qmp_bridge(self.qmp_bridge)
+        if "vm_switcher" in self.panels:
+            # One manager for the whole window. The switcher used to build its
+            # own, so the control panel was reading a different in-memory copy
+            # of the same configs and every field rendered "—".
+            self.vm_manager = self.panels["vm_switcher"].get_manager()
+            # Selecting a VM has to reach the panels that display it. These
+            # signals were emitted but never connected, so nothing on screen
+            # ever followed the selection.
+            self.panels["vm_switcher"].vm_changed.connect(self._on_active_vm_changed)
+            self.panels["vm_switcher"].vm_added.connect(self._on_active_vm_changed)
+            self.panels["vm_switcher"].vm_removed.connect(self._on_active_vm_changed)
         if "vm_control" in self.panels:
-            self.panels["vm_control"].set_multi_qmp_bridge(self.qmp_bridge)
+            self.panels["vm_control"].set_manager(self.vm_manager)
+            # Deliberately not set_multi_qmp_bridge(self.qmp_bridge): qmp_bridge
+            # is a single-VM QMPBridge with neither switch_to_vm nor
+            # get_bridge, so every call on it raised AttributeError. The panel
+            # builds a MultiVMQMPBridge per selected VM from the manager.
         if "guest_terminal" in self.panels:
             self.panels["guest_terminal"].set_ssh_bridge(self.ssh_bridge)
         if "guest_agent" in self.panels:
@@ -721,6 +740,19 @@ class MainWindow(QMainWindow):
         self._load_plugin_panels()
 
         self._switch_panel("dashboard")
+
+    def _on_active_vm_changed(self, vm_name: str) -> None:
+        """Keep every VM-aware panel pointed at the newly selected VM.
+
+        The switcher emits this; without it the control panel's config grid and
+        button states described whatever VM happened to be selected when the
+        window opened, which was none.
+        """
+        self.active_vm_name = vm_name
+        for panel_name in ("vm_control", "vm_console", "guest_terminal"):
+            panel = self.panels.get(panel_name)
+            if panel is not None and hasattr(panel, "switch_to_vm"):
+                panel.switch_to_vm(vm_name)
 
     def _switch_panel(self, name: str):
         if name in self.panels:
