@@ -263,6 +263,19 @@ def _add_host_ops(cat: Catalog, engine: Engine) -> None:
         """This machine: OS, CPUs, memory, whether hardware virtualization is on"""
         return await asyncio.to_thread(host_info)
 
+    @cat.op("host.capabilities", group="host")
+    async def capabilities() -> dict:
+        """What this machine can actually run: usable accelerators, and CPU/RAM sizing that leaves the host room"""
+        from vm_harness import env
+
+        caps = await asyncio.to_thread(env.host_capabilities)
+        payload = caps.to_dict()
+        payload["suggested"] = {
+            "vcpus": caps.suggest_cpu_count(),
+            "ram_mb": caps.suggest_ram_mb(),
+        }
+        return payload
+
     @cat.op("host.backends", group="host")
     async def backends() -> dict:
         """Which hypervisors and container engines work here, their versions, and why the others do not"""
