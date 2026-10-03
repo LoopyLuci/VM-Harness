@@ -1,3 +1,9 @@
+# Runtime dependencies. This mirrors [project.dependencies] in pyproject.toml;
+# keep the two in step (pycdlib is required by vm_harness.cloudinit for ISO9660
+# cloud-init seeds, and by no other dependency in the tree).
+#
+# Test/lint tooling is not listed here: install it with `pip install -e ".[dev]"`
+# for the [project.optional-dependencies] dev extra.
 mcp[cli]>=1.0.0
 pydantic>=2.0.0
 pydantic-settings>=2.0.0

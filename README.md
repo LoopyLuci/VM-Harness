@@ -18,7 +18,7 @@ operations, MCP, and driving the window remotely.
 ## Features
 
 - **34 GUI Panels** — Complete VM control from a polished dark-themed desktop interface
-- **CLI Tool** — Command-line interface for scripting and agent access
+- **Command line** — every operation from the shell, over the same hub as the window and the MCP server
 - **REST API** — HTTP endpoints for programmatic control
 - **MCP Server** — every operation as an MCP tool, including driving the window (`python -m vm_harness mcp`)
 - **Self-Healing** — Atomic state, process guardian, automatic recovery
@@ -26,18 +26,7 @@ operations, MCP, and driving the window remotely.
 - **ISO Manager** — Internal storage + external folder scanning + downloads
 - **Guest Integration** — SSH terminal, file browser, process manager
 
-## Quick Start
-
-```bash
-pip install -e ".[dev]"
-
-qemu-mcp gui              # Launch GUI
-qemu-mcp status           # CLI status
-qemu-mcp api start        # REST API
-python -m vm_mcp          # MCP server
-```
-
-## GUI Panels (23 Total)
+## GUI Panels (the core set)
 
 | # | Panel | Description |
 |---|-------|-------------|
@@ -74,19 +63,23 @@ python -m vm_mcp          # MCP server
 
 ## CLI Reference
 
+The console script `vm-harness` and `python -m vm_harness` are the same program.
+
 ```bash
-qemu-mcp status                  # System status
-qemu-mcp vm list                 # List VMs
-qemu-mcp vm start <name>         # Start VM
-qemu-mcp vm stop <name>          # Stop VM
-qemu-mcp vm restart <name>       # Restart VM
-qemu-mcp snapshot list           # List snapshots
-qemu-mcp snapshot create <name>  # Create snapshot
-qemu-mcp iso list                # List ISOs
-qemu-mcp config get              # Get configuration
-qemu-mcp api start --port 8080   # Start REST API
-qemu-mcp gui                     # Launch GUI
+vm-harness status                  # is the hub running, is the window attached
+vm-harness serve                   # run the hub (the local API every client uses)
+vm-harness stop                    # stop the hub
+vm-harness gui                     # open the window (it attaches to the hub)
+vm-harness mcp                     # MCP server on stdio
+vm-harness ops [query]             # list operations, or search them
+vm-harness ops --group vm          # just one group
+vm-harness call vm.list            # run one operation
+vm-harness call vm.start name=Kali # arguments as key=value, or --json '{...}'
 ```
+
+The `vm.*`, `iso.*`, `container.*` and `host.*` names are operation IDs, not subcommands: `vm.list`,
+`vm.start`, `vm.stop`, `vm.snapshot.create`, `iso.list`, `container.list`, `host.capabilities`, and about 160 more.
+`vm-harness ops` lists them all with a summary; `docs/control.md` documents them.
 
 ## Phone API (the Android app)
 
@@ -112,9 +105,27 @@ vm_harness serve`) and MCP (`python -m vm_harness mcp`). See [docs/control.md](d
 ## Testing and the local CI/CD pipeline
 
 ```bash
-pytest tests -n auto               # the whole suite in parallel (about 750 tests, under 2 minutes)
-python ci/pipeline.py              # everything this change needs (see below)
-python ci/install_hooks.py         # once: every `git push` runs the pipeline first
+pytest                              # the default run; see below for what it excludes
+pytest -n auto                      # the same set in parallel (needs pytest-xdist)
+python ci/pipeline.py               # everything this change needs (see below)
+python ci/install_hooks.py          # once: every `git push` runs the pipeline first
+```
+
+`pytest` needs no environment variables: `pyproject.toml` sets `pythonpath = ["src"]`, so a plain `pytest` in a
+checkout picks up `vm_harness` without `PYTHONPATH` and without installing.
+
+Two files are excluded from the default run, by `--ignore` in `addopts`:
+
+| Excluded | Why | Needs |
+|----------|-----|-------|
+| `tests/test_gui_comprehensive.py` | drives the container and Kubernetes panels | a live Docker daemon and a reachable cluster |
+| `tests/test_gui_performance.py` | boots real guests and times panel switches | a real hypervisor with usable VMs |
+
+On a host without those services they do not fail — they block forever. Nothing else is excluded. On a host that has
+them, run them by clearing the default `addopts`:
+
+```bash
+pytest tests/test_gui_comprehensive.py tests/test_gui_performance.py --override-ini addopts=
 ```
 
 `ci/pipeline.py` runs on this machine, with no cloud runner. Each stage runs only when the change needs it. When the

@@ -4,6 +4,8 @@ logs/
 
 # Secrets
 .env
+.env.*
+!.env.example
 .secrets.json
 
 # SSH known hosts
@@ -56,19 +58,19 @@ master_key
 keyfile
 
 # Secrets and tokens
+# Patterns, not just the names that happened to be created once: pairing tokens
+# and self-signed certs are generated at runtime, so any of them must be ignored.
 token.txt
-token_new.txt
-fresh_token.txt
-final_token.txt
-final_pairing_token.txt
-pairing_token.txt
-pairing_token_full.txt
-android_token.txt
+*token*.txt
+*.token
 pairing_qr.png
 
 # TLS certificates and keys
 cert.pem
 key.pem
+*.pem
+*.p12
+*.pfx
 
 # Machine IDs and signing keys
 .qmcmcp_machine_id
@@ -76,6 +78,7 @@ key.pem
 .vmharness_signing_key
 
 # Runtime files
+*.pid
 .vm_gui.pid
 gui/.vmharness_single_instance.lock
 file
