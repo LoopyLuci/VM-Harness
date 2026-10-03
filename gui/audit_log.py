@@ -28,9 +28,10 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
-from PyQt5.QtCore import QObject, pyqtSignal, Qt, QTimer, QSizePolicy
+from PyQt5.QtCore import QObject, pyqtSignal, Qt, QTimer
 from PyQt5.QtGui import QColor, QBrush, QFont
 from PyQt5.QtWidgets import (
+    QSizePolicy,
     QWidget,
     QVBoxLayout,
     QHBoxLayout,
