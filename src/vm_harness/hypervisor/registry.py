@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import importlib
 import logging
 import os
 import platform
@@ -80,53 +81,34 @@ class HypervisorRegistry:
                 self.register(name, cls)
 
     def _register_defaults(self) -> None:
-        """Register the built-in backends with lazy imports to avoid hard deps."""
+        """Register the built-in backends with lazy imports to avoid hard deps.
+
+        Imports are attempted one at a time and each successfully imported
+        class is registered immediately, so a backend whose module fails to
+        import on this platform never prevents the others from registering.
+        """
         # We use lazy imports so each backend module only loads when needed.
         # This avoids importing platform-specific modules on the wrong OS.
-
-        # QEMU
         self._backend_factories: dict[str, Type[HypervisorBackend]] = {}
 
-        try:
-            from vm_harness.hypervisor.qemu.backend import QEMUBackend
-            self._backend_factories["qemu"] = QEMUBackend
-        except ImportError:
-            logger.debug("QEMU backend not available for import")
+        candidates = (
+            ("qemu", "vm_harness.hypervisor.qemu.backend", "QEMUBackend"),
+            ("vmware", "vm_harness.hypervisor.vmware.backend", "VMwareBackend"),
+            ("virtualbox", "vm_harness.hypervisor.virtualbox.backend", "VirtualBoxBackend"),
+            ("wsl", "vm_harness.hypervisor.wsl.backend", "WSLBackend"),
+            ("hyperv", "vm_harness.hypervisor.hyperv.backend", "HyperVBackend"),
+            ("kvm", "vm_harness.hypervisor.kvm.backend", "KVMBackend"),
+        )
 
-        # VMware
-        try:
-            from vm_harness.hypervisor.vmware.backend import VMwareBackend
-            self._backend_factories["vmware"] = VMwareBackend
-        except ImportError:
-            logger.debug("VMware backend not available for import")
-
-        # VirtualBox
-        try:
-            from vm_harness.hypervisor.virtualbox.backend import VirtualBoxBackend
-            self._backend_factories["virtualbox"] = VirtualBoxBackend
-        except ImportError:
-            logger.debug("VirtualBox backend not available for import")
-
-        # WSL
-        try:
-            from vm_harness.hypervisor.wsl.backend import WSLBackend
-            self._backend_factories["wsl"] = WSLBackend
-        except ImportError:
-            logger.debug("WSL backend not available for import")
-
-        # Hyper-V
-        try:
-            from vm_harness.hypervisor.hyperv.backend import HyperVBackend
-            self._backend_factories["hyperv"] = HyperVBackend
-        except ImportError:
-            logger.debug("Hyper-V backend not available for import")
-
-        # KVM
-        try:
-            from vm_harness.hypervisor.kvm.backend import KVMBackend
-            self._backend_factories["kvm"] = KVMBackend
-        except ImportError:
-            logger.debug("KVM backend not available for import")
+        for name, module_path, class_name in candidates:
+            try:
+                module = importlib.import_module(module_path)
+                cls = getattr(module, class_name)
+            except (ImportError, AttributeError) as e:
+                logger.debug("Backend '%s' not importable: %s", name, e)
+                continue
+            self._backend_factories[name] = cls
+            self.register(name, cls)
 
     # ── Public API ───────────────────────────────────────────────────────────
 

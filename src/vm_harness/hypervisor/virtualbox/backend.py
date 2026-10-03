@@ -64,6 +64,27 @@ else:  # Linux
     DEFAULT_MACHINE_FOLDER = str(Path.home() / "VirtualBox VMs")
 
 
+def find_vboxmanage() -> str | None:
+    """Locate VBoxManage: ``$VMH_VBOXMANAGE``, then PATH, then the usual install places.
+
+    Distributions and package managers place VirtualBox in different prefixes
+    (``/usr/bin``, ``/opt/VirtualBox``, ``/usr/local/bin``), so a single
+    hardcoded absolute path is not portable. PATH is consulted first.
+    """
+    exe = "VBoxManage.exe" if os.name == "nt" else "VBoxManage"
+    candidates = [
+        Path(d) / exe
+        for d in (
+            DEFAULT_VBOXMANAGE,
+            r"C:\Program Files\Oracle\VirtualBox",
+            "/usr/bin",
+            "/usr/local/bin",
+            "/opt/VirtualBox",
+        )
+    ]
+    return _proc.find_tool(["VBoxManage"], candidates, env_var="VMH_VBOXMANAGE")
+
+
 # ── VirtualBoxBackend ──────────────────────────────────────────────────────────
 
 class VirtualBoxBackend(HypervisorBackend):
@@ -75,7 +96,11 @@ class VirtualBoxBackend(HypervisorBackend):
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         super().__init__(config)
-        self._vboxmanage_path = self._config.get("vboxmanage_path", DEFAULT_VBOXMANAGE)
+        self._vboxmanage_path = (
+            self._config.get("vboxmanage_path")
+            or find_vboxmanage()
+            or DEFAULT_VBOXMANAGE
+        )
         self._vms_dir = Path(self._config.get("vms_dir", str(Path.home() / ".qemu-mcp" / "vbox-vms")))
         self._vms_dir.mkdir(parents=True, exist_ok=True)
         self._default_machine_folder = self._config.get("default_machine_folder", DEFAULT_MACHINE_FOLDER)

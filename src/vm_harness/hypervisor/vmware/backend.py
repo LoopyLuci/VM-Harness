@@ -64,6 +64,28 @@ else:  # Linux
     DEFAULT_VMX_DIR = str(Path.home() / "vmware")
 
 
+def find_vmrun() -> str | None:
+    """Locate vmrun: ``$VMH_VMRUN``, then PATH, then the usual install places.
+
+    VMware ships vmrun inside the application bundle on macOS and under
+    several Program Files roots on Windows, so PATH is consulted before the
+    hardcoded fallbacks.
+    """
+    exe = "vmrun.exe" if os.name == "nt" else "vmrun"
+    candidates = [
+        Path(d) / exe
+        for d in (
+            DEFAULT_VMRUN,
+            r"C:\Program Files (x86)\VMware\VMware Workstation",
+            r"C:\Program Files\VMware\VMware Workstation",
+            "/Applications/VMware Fusion.app/Contents/Library",
+            "/usr/bin",
+            "/usr/local/bin",
+        )
+    ]
+    return _proc.find_tool(["vmrun"], candidates, env_var="VMH_VMRUN")
+
+
 # ── VMwareBackend ─────────────────────────────────────────────────────────────
 
 class VMwareBackend(HypervisorBackend):
@@ -75,7 +97,11 @@ class VMwareBackend(HypervisorBackend):
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         super().__init__(config)
-        self._vmrun_path = self._config.get("vmrun_path", DEFAULT_VMRUN)
+        self._vmrun_path = (
+            self._config.get("vmrun_path")
+            or find_vmrun()
+            or DEFAULT_VMRUN
+        )
         self._vms_dir = Path(self._config.get("vms_dir", str(Path.home() / ".qemu-mcp" / "vmware-vms")))
         self._vms_dir.mkdir(parents=True, exist_ok=True)
         self._default_disk_dir = self._config.get("default_disk_dir", DEFAULT_VMX_DIR)
