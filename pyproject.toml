@@ -25,6 +25,10 @@ dependencies = [
     "aioquic>=0.9.0",
     "zeroconf>=0.130.0",
     "tailscale>=0.1.0",
+    # Pure-Python ISO9660 writer for cloud-init NoCloud seeds (vm_harness.cloudinit).
+    # Portable, needs no privileges, and emits Joliet + Rock Ridge so long
+    # filenames survive.
+    "pycdlib>=1.14.0",
 ]
 
 [project.optional-dependencies]

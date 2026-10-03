@@ -276,6 +276,43 @@ def _add_host_ops(cat: Catalog, engine: Engine) -> None:
         }
         return payload
 
+    @cat.op("cloudinit.backends", group="cloudinit")
+    async def seed_backends() -> dict:
+        """Which NoCloud seed builders this host can use"""
+        from vm_harness.cloudinit import SeedBuilder
+
+        return SeedBuilder().describe()
+
+    @cat.op("cloudinit.build", group="cloudinit", mutating=True)
+    async def seed_build(path: str, hostname: str = "", timezone: str = "", username: str = "",
+                         password_hash: str = "", full_name: str = "", email: str = "",
+                         encrypt: bool = False, files: dict | None = None,
+                         required_files: list | None = None, backend: str = "auto") -> dict:
+        """Write a cloud-init NoCloud seed (labelled cidata) and verify it
+
+        Attach the result to a VM as a second CD-ROM and the guest configures
+        itself instead of showing a setup wizard. `files` carries
+        installer-specific documents (e.g. Omarchy's user_configuration.json).
+        The seed is verified before this returns, so a malformed image is an
+        error rather than a silent boot to an interactive wizard."""
+        from vm_harness.cloudinit import NoCloudSeed, SeedBuilder, verify_seed
+
+        required = tuple(required_files or (sorted(files) if files else ()))
+        seed = NoCloudSeed(
+            hostname=hostname or None,
+            timezone=timezone or None,
+            username=username or None,
+            password_hash=password_hash or None,
+            full_name=full_name or None,
+            email=email or None,
+            extra_files=files or {},
+            encrypt=bool(encrypt),
+            required_files=required,
+        )
+        written = await asyncio.to_thread(SeedBuilder(backend).build, seed, path)
+        return {"path": str(written), "bytes": written.stat().st_size,
+                "verified": verify_seed(written, required), "label": seed.label}
+
     @cat.op("host.backends", group="host")
     async def backends() -> dict:
         """Which hypervisors and container engines work here, their versions, and why the others do not"""

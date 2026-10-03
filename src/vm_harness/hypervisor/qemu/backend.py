@@ -1140,12 +1140,16 @@ class QEMUBackend(HypervisorBackend):
         if headless or display_type == "headless":
             args.extend(["-display", "none"])
         elif display_type == "spice":
+            # QEMU removed "-display spice"; the server is configured with
+            # -spice and the guest output is left headless for a client to
+            # attach to. Passing "-display spice" now fails with
+            # "Parameter 'type' does not accept value 'spice'".
             spice_args = ["disable-ticketing", "streaming-video=all"]
             if display_port:
                 spice_args.insert(0, f"port={display_port}")
             if display_password:
                 spice_args.append(f"password={display_password}")
-            args.extend(["-display", "spice", "-spice", ",".join(spice_args)])
+            args.extend(["-spice", ",".join(spice_args), "-display", "none"])
         elif display_type == "vnc":
             vnc_port = display_port or 5900
             args.extend(["-vnc", f":{vnc_port - 5900}", "-display", "none"])
