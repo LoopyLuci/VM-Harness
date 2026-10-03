@@ -78,8 +78,8 @@ impl Event {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmRuntimeState {
     pub vm_id: VmId,
-    pub state: crate::VmState,
-    pub config: crate::VmConfig,
+    pub state: vmharness_core::VmState,
+    pub config: vmharness_core::VmConfig,
     pub pid: Option<u32>,
     pub started_at: Option<DateTime<Utc>>,
     pub last_stop_reason: Option<String>,

@@ -196,7 +196,15 @@ class VMwareVBoxPanel(QWidget):
         self._current_provider = "vmware" if index == 0 else "virtualbox"
         self._refresh()
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Refresh when shown (the timer skips hidden panels), after the switch has painted.
+        from PyQt5.QtCore import QTimer as _QTimer
+        _QTimer.singleShot(0, self._refresh)
+
     def _refresh(self):
+        if not self.isVisible():
+            return  # a hidden panel does not poll its backends (that froze the window when one was down)
         self._check_backends()
         self._load_vmware()
         self._load_vbox()

@@ -98,7 +98,7 @@ Section "!VM-Harness Application" SEC01
   SetOutPath "$INSTDIR"
   SetOverwrite ifnewer
 
-  ; Main executable + .pyd
+; Main executable + compiled Rust supervisor extension
   File /r "dist\VM-Harness\*.*"
   File "target\release\vmharness_supervisor.pyd"
 

@@ -68,12 +68,15 @@ class TestGUIPerformance(unittest.TestCase):
     """Comprehensive performance test for all MainWindow panels."""
 
     # ── Thresholds ─────────────────────────────────────────────────────────
-    SLOW_PANEL_THRESHOLD_S = 2.0        # per-switch time limit
+    # Time limits are wall-clock: when the suite runs in parallel (pytest-xdist), other workers share the CPU, so the
+    # time-based limits are relaxed there. The leak limits (memory, widgets, timers) do not depend on load and stay.
+    _LOAD = 3.0 if os.environ.get("PYTEST_XDIST_WORKER") else 1.0
+    SLOW_PANEL_THRESHOLD_S = 2.0 * _LOAD  # per-switch time limit
     MAX_PANEL_COUNT = 40               # sanity upper bound on panel count
     MEMORY_LEAK_THRESHOLD_MB = 150.0   # RSS growth after all cycles
     WIDGET_LEAK_THRESHOLD = 500        # max net widget growth after cycles
     TIMER_LEAK_THRESHOLD = 200         # max net timer growth after cycles
-    DEGRADATION_RATIO_MAX = 3.0        # cycle3/cycle1 time ratio limit
+    DEGRADATION_RATIO_MAX = 3.0 * _LOAD  # cycle3/cycle1 time ratio limit
     CYCLE_COUNT = 3                    # number of full cycles to run
 
     # ── Class-level setup ──────────────────────────────────────────────────

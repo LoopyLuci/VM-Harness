@@ -18,6 +18,8 @@ import logging
 import os
 import platform
 import subprocess
+
+from vm_harness import _proc
 # Suppress CLI console windows on Windows
 CREATE_NO_WINDOW = 0x08000000
 from datetime import datetime
@@ -27,6 +29,9 @@ from typing import Any
 from vm_harness.hypervisor.backend import (
     BackendNotAvailableError,
     HypervisorBackend,
+    HypervisorError,
+    OperationNotSupportedError,
+    VMAlreadyRunningError,
     VMConfig,
     VMConsole,
     VMDisplay,
@@ -37,7 +42,6 @@ from vm_harness.hypervisor.backend import (
     VMNetworkMode,
     VMNotFoundError,
     VMNotRunningError,
-    OperationNotSupportedError,
     VMSnapshot,
     VMState,
     VMStatus,
@@ -48,15 +52,41 @@ logger = logging.getLogger(__name__)
 DEFAULT_POWERSHELL = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
 
 
-def _run_ps(command: str, timeout: int = 30) -> subprocess.CompletedProcess:
-    """Run a PowerShell command and return the result."""
-    return subprocess.run(
-        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
-        capture_output=True, text=True, timeout=timeout
-    )
+def ps_quote(value: Any) -> str:
+    """A PowerShell single-quoted string literal: a name with a quote in it can neither break nor extend a command."""
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _ps_args(command: str) -> list[str]:
+    return ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+            "$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; " + command]
+
+
+def _run_ps_sync(command: str, timeout: int = 30) -> subprocess.CompletedProcess:
+    return _proc.run_sync(_ps_args(command), timeout=timeout)
+
+
+async def _run_ps(command: str, timeout: int = 30) -> subprocess.CompletedProcess:
+    """Run a PowerShell command off the event loop. A failing cmdlet raises HypervisorError with its message."""
+    result = await _proc.run(_ps_args(command), timeout=timeout)
+    if result.returncode != 0:
+        text = (result.stderr or result.stdout).strip()
+        message = text.splitlines()[0][:500] if text else f"PowerShell exited {result.returncode}"
+        if "unable to find a virtual machine" in text:
+            raise VMNotFoundError(message)
+        raise HypervisorError(message)
+    return result
 
 
 # ── HyperVBackend ──────────────────────────────────────────────────────────────
+
+HYPERV_STATES = {
+    "Off": VMState.STOPPED, "Running": VMState.RUNNING, "Paused": VMState.PAUSED, "Saved": VMState.SUSPENDED,
+    "FastSaved": VMState.SUSPENDED, "Starting": VMState.STARTING, "Stopping": VMState.STOPPING,
+    "Saving": VMState.STOPPING, "FastSaving": VMState.STOPPING, "Pausing": VMState.PAUSED,
+    "Resuming": VMState.STARTING, "Reset": VMState.STARTING, "Other": VMState.UNKNOWN,
+}
+
 
 class HyperVBackend(HypervisorBackend):
     """Microsoft Hyper-V backend using PowerShell cmdlets.
@@ -84,7 +114,7 @@ class HyperVBackend(HypervisorBackend):
     @property
     def version(self) -> str:
         try:
-            result = _run_ps("(Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V).State")
+            result = _run_ps_sync("(Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V).State")
             if "Enabled" in result.stdout:
                 return "hyperv-enabled"
         except Exception:
@@ -96,7 +126,7 @@ class HyperVBackend(HypervisorBackend):
         if os.name != "nt":
             return False
         try:
-            result = _run_ps("Get-Command Get-VM -ErrorAction SilentlyContinue")
+            result = _run_ps_sync("Get-Command Get-VM -ErrorAction SilentlyContinue")
             return result.returncode == 0 and "Get-VM" in result.stdout
         except Exception:
             return False
@@ -129,7 +159,7 @@ class HyperVBackend(HypervisorBackend):
 
     async def list_vms(self) -> list[str]:
         """List all Hyper-V VMs."""
-        result = _run_ps("Get-VM | Select-Object -ExpandProperty Name")
+        result = await _run_ps("Get-VM | Select-Object -ExpandProperty Name")
         if result.returncode == 0:
             return [line.strip() for line in result.stdout.split("\n") if line.strip()]
         return []
@@ -139,7 +169,7 @@ class HyperVBackend(HypervisorBackend):
     async def create_vm(self, config: VMConfig) -> str:
         """Create a new Hyper-V VM."""
         if await self.find_vm(config.name):
-            raise VMAlreadyRunningError(f"VM '{config.name}' already exists")
+            raise VMAlreadyRunningError(f"VM {ps_quote(config.name)} already exists")
 
         vm_dir = Path(self._default_vhd_path) / config.name
         vm_dir.mkdir(parents=True, exist_ok=True)
@@ -147,34 +177,34 @@ class HyperVBackend(HypervisorBackend):
 
         # Create VHDX
         if config.disk_size_gb > 0:
-            ps_cmd = f"New-VHD -Path '{vhdx_path}' -SizeBytes {config.disk_size_gb}GB -Dynamic"
-            _run_ps(ps_cmd)
+            ps_cmd = f"New-VHD -Path {ps_quote(vhdx_path)} -SizeBytes {config.disk_size_gb}GB -Dynamic"
+            await _run_ps(ps_cmd)
 
         # Create VM
         ps_cmd = (
-            f"New-VM -Name '{config.name}' "
+            f"New-VM -Name {ps_quote(config.name)} "
             f"-MemoryStartupBytes {config.ram_mb}MB "
             f"-Generation 2 "
-            f"-NewVHDPath '{vhdx_path}' "
+            f"-NewVHDPath {ps_quote(vhdx_path)} "
             f"-NewVHDSizeBytes {config.disk_size_gb * 1024 * 1024 * 1024} "
-            f"-SwitchName '{self._default_switch}'"
+            f"-SwitchName {ps_quote(self._default_switch)}"
         )
-        _run_ps(ps_cmd)
+        await _run_ps(ps_cmd)
 
         # Configure CPUs
         if config.cpus > 1:
-            _run_ps(f"Set-VMProcessor -VMName '{config.name}' -Count {config.cpus}")
+            await _run_ps(f"Set-VMProcessor -VMName {ps_quote(config.name)} -Count {config.cpus}")
 
         # Configure firmware
         if config.boot_firmware == "uefi":
-            _run_ps(f"Set-VMFirmware -VMName '{config.name}' -EnableSecureBoot On")
+            await _run_ps(f"Set-VMFirmware -VMName {ps_quote(config.name)} -EnableSecureBoot On")
         else:
-            _run_ps(f"Set-VMFirmware -VMName '{config.name}' -EnableSecureBoot Off")
+            await _run_ps(f"Set-VMFirmware -VMName {ps_quote(config.name)} -EnableSecureBoot Off")
 
         # Mount ISO
         if config.iso_path:
-            ps_cmd = f"Add-VMDvdDrive -VMName '{config.name}' -Path '{config.iso_path}'"
-            _run_ps(ps_cmd)
+            ps_cmd = f"Add-VMDvdDrive -VMName {ps_quote(config.name)} -Path {ps_quote(config.iso_path)}"
+            await _run_ps(ps_cmd)
 
         # Save metadata
         vm_config = {
@@ -196,15 +226,15 @@ class HyperVBackend(HypervisorBackend):
     async def destroy_vm(self, name: str) -> None:
         """Delete a Hyper-V VM."""
         if not await self.find_vm(name):
-            raise VMNotFoundError(f"VM '{name}' not found")
+            raise VMNotFoundError(f"VM {ps_quote(name)} not found")
 
         # Stop if running
         try:
-            _run_ps(f"Stop-VM -Name '{name}' -TurnOff -Force", timeout=30)
+            await _run_ps(f"Stop-VM -Name {ps_quote(name)} -TurnOff -Force", timeout=30)
         except Exception:
             pass
 
-        _run_ps(f"Remove-VM -Name '{name}' -Force", timeout=30)
+        await _run_ps(f"Remove-VM -Name {ps_quote(name)} -Force", timeout=30)
 
         # Remove metadata
         config_path = self._vms_dir / f"{name}.json"
@@ -216,93 +246,73 @@ class HyperVBackend(HypervisorBackend):
     async def start_vm(self, name: str, headless: bool = False) -> None:
         """Start a Hyper-V VM."""
         if not await self.find_vm(name):
-            raise VMNotFoundError(f"VM '{name}' not found")
+            raise VMNotFoundError(f"VM {ps_quote(name)} not found")
 
-        _run_ps(f"Start-VM -Name '{name}'", timeout=30)
+        await _run_ps(f"Start-VM -Name {ps_quote(name)}", timeout=30)
         logger.info("Started Hyper-V VM '%s'", name)
 
     async def stop_vm(self, name: str, force: bool = False) -> None:
         """Stop a Hyper-V VM."""
         if not await self.find_vm(name):
-            raise VMNotFoundError(f"VM '{name}' not found")
+            raise VMNotFoundError(f"VM {ps_quote(name)} not found")
 
         if force:
-            _run_ps(f"Stop-VM -Name '{name}' -TurnOff -Force", timeout=30)
+            await _run_ps(f"Stop-VM -Name {ps_quote(name)} -TurnOff -Force", timeout=30)
         else:
-            _run_ps(f"Stop-VM -Name '{name}' -Save", timeout=30)
+            await _run_ps(f"Stop-VM -Name {ps_quote(name)} -Save", timeout=30)
         logger.info("Stopped Hyper-V VM '%s'", name)
 
     async def pause_vm(self, name: str) -> None:
         """Pause a Hyper-V VM."""
         if not await self.find_vm(name):
-            raise VMNotFoundError(f"VM '{name}' not found")
-        _run_ps(f"Suspend-VM -Name '{name}'", timeout=30)
+            raise VMNotFoundError(f"VM {ps_quote(name)} not found")
+        await _run_ps(f"Suspend-VM -Name {ps_quote(name)}", timeout=30)
 
     async def resume_vm(self, name: str) -> None:
         """Resume a paused Hyper-V VM."""
         if not await self.find_vm(name):
-            raise VMNotFoundError(f"VM '{name}' not found")
-        _run_ps(f"Resume-VM -Name '{name}'", timeout=30)
+            raise VMNotFoundError(f"VM {ps_quote(name)} not found")
+        await _run_ps(f"Resume-VM -Name {ps_quote(name)}", timeout=30)
 
     async def reset_vm(self, name: str) -> None:
         """Reset a Hyper-V VM."""
         if not await self.find_vm(name):
-            raise VMNotFoundError(f"VM '{name}' not found")
-        _run_ps(f"Restart-VM -Name '{name}' -Force", timeout=30)
+            raise VMNotFoundError(f"VM {ps_quote(name)} not found")
+        await _run_ps(f"Restart-VM -Name {ps_quote(name)} -Force", timeout=30)
 
     async def reboot_vm(self, name: str, graceful: bool = True) -> None:
         """Reboot a Hyper-V VM."""
         if not await self.find_vm(name):
-            raise VMNotFoundError(f"VM '{name}' not found")
-        _run_ps(f"Restart-VM -Name '{name}' -Force", timeout=30)
+            raise VMNotFoundError(f"VM {ps_quote(name)} not found")
+        await _run_ps(f"Restart-VM -Name {ps_quote(name)} -Force", timeout=30)
 
     async def shutdown_guest(self, name: str, timeout: int = 30) -> None:
         """Gracefully shut down the Hyper-V guest."""
         if not await self.find_vm(name):
-            raise VMNotFoundError(f"VM '{name}' not found")
-        _run_ps(f"Stop-VM -Name '{name}' -Force", timeout=timeout)
+            raise VMNotFoundError(f"VM {ps_quote(name)} not found")
+        await _run_ps(f"Stop-VM -Name {ps_quote(name)} -Force", timeout=timeout)
 
     # ── Status / Info ────────────────────────────────────────────────────────
 
     async def get_status(self, name: str) -> VMStatus:
-        """Get the status of a Hyper-V VM."""
-        if not await self.find_vm(name):
-            raise VMNotFoundError(f"VM '{name}' not found")
-
-        result = _run_ps(
-            f"Get-VM -Name '{name}' | Select-Object Name, State, Status, "
-            f"CPUUsage, MemoryAssigned, MemoryStartup, Uptime | ConvertTo-Json"
+        """Get the status of a Hyper-V VM (state as its name, so it never depends on the enum's numbering)."""
+        result = await _run_ps(
+            f"Get-VM -Name {ps_quote(name)} | Select-Object Name, @{{n='State';e={{$_.State.ToString()}}}}, "
+            f"@{{n='Status';e={{[string]$_.Status}}}}, CPUUsage, MemoryAssigned, MemoryStartup, ProcessorCount, "
+            f"@{{n='UptimeSeconds';e={{[int]$_.Uptime.TotalSeconds}}}} | ConvertTo-Json -Compress"
         )
         status = VMStatus(name=name, backend_name=self.default_name)
-
-        if result.returncode == 0:
-            try:
-                vm_data = json.loads(result.stdout)
-                state_map = {
-                    "Off": VMState.STOPPED,
-                    "Running": VMState.RUNNING,
-                    "Saved": VMState.SUSPENDED,
-                    "Paused": VMState.PAUSED,
-                    "Starting": VMState.STARTING,
-                    "Stopping": VMState.STOPPING,
-                    "Saved": VMState.SUSPENDED,
-                    "Restoring": VMState.RESTORING,
-                }
-                state_str = vm_data.get("State", 0)
-                # Hyper-V states are numeric: 2=Running, 3=Off, 32768=Paused, 32769=Saved
-                state_map_int = {
-                    2: VMState.RUNNING,
-                    3: VMState.STOPPED,
-                    32768: VMState.PAUSED,
-                    32769: VMState.SUSPENDED,
-                }
-                status.state = state_map_int.get(state_str, VMState.UNKNOWN)
-                status.cpu_usage_pct = vm_data.get("CPUUsage", 0)
-                status.ram_usage_mb = vm_data.get("MemoryAssigned", 0) // (1024 * 1024)
-                status.ram_allocated_mb = vm_data.get("MemoryStartup", 0) // (1024 * 1024)
-            except json.JSONDecodeError:
-                pass
-
+        try:
+            vm_data = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return status
+        status.state = HYPERV_STATES.get(str(vm_data.get("State", "")), VMState.UNKNOWN)
+        status.last_error = "" if vm_data.get("Status") in ("Operating normally", "", None) else str(vm_data.get("Status"))
+        status.cpu_usage_pct = float(vm_data.get("CPUUsage") or 0)
+        status.ram_usage_mb = int(vm_data.get("MemoryAssigned") or 0) // (1024 * 1024)
+        status.ram_allocated_mb = int(vm_data.get("MemoryStartup") or 0) // (1024 * 1024)
+        status.cpus_allocated = int(vm_data.get("ProcessorCount") or 0)
+        status.uptime_seconds = int(vm_data.get("UptimeSeconds") or 0)
         return status
 
     async def get_config(self, name: str) -> VMConfig | None:
@@ -310,8 +320,8 @@ class HyperVBackend(HypervisorBackend):
         if not await self.find_vm(name):
             return None
 
-        result = _run_ps(
-            f"Get-VM -Name '{name}' | Select-Object Name, ProcessorCount, "
+        result = await _run_ps(
+            f"Get-VM -Name {ps_quote(name)} | Select-Object Name, ProcessorCount, "
             f"MemoryStartup, MemoryMinimum, MemoryMaximum | ConvertTo-Json"
         )
         if result.returncode == 0:
@@ -351,29 +361,36 @@ class HyperVBackend(HypervisorBackend):
                          env: dict[str, str] | None = None,
                          timeout: int = 30,
                          capture_output: bool = True) -> dict[str, Any]:
-        """Execute a command inside the Hyper-V guest."""
-        if not await self.find_vm(name):
-            raise VMNotFoundError(f"VM '{name}' not found")
+        """Run a command in a Windows guest through PowerShell Direct (no network needed).
 
-        ps_cmd = f"Invoke-Command -VMName '{name}' -ScriptBlock {{ {command} }}"
-        if args:
-            arg_str = " ".join(args)
-            ps_cmd = f'Invoke-Command -VMName \'{name}\' -ScriptBlock {{ {command} {arg_str} }}'
-
-        result = _run_ps(ps_cmd, timeout=timeout)
-        return {
-            "exit_code": result.returncode,
-            "stdout": result.stdout or "",
-            "stderr": result.stderr or "",
-            "timed_out": False,
-        }
+        Needs the guest's credentials: ``guest_username`` / ``guest_password`` in the backend config. The command and
+        its arguments are passed as data, never pasted into the script, so they cannot change what runs."""
+        user = self._config.get("guest_username")
+        password = self._config.get("guest_password")
+        if not user or password is None:
+            raise OperationNotSupportedError("PowerShell Direct needs guest_username and guest_password for this VM")
+        payload = json.dumps({"command": command, "args": list(args or []), "env": dict(env or {})})
+        script = (
+            f"$p = ConvertFrom-Json {ps_quote(payload)}; "
+            f"$cred = New-Object PSCredential({ps_quote(user)}, (ConvertTo-SecureString {ps_quote(password)} -AsPlainText -Force)); "
+            f"$r = Invoke-Command -VMName {ps_quote(name)} -Credential $cred -ArgumentList $p -ScriptBlock {{ "
+            f"param($p); foreach ($k in $p.env.PSObject.Properties) {{ Set-Item -Path ('env:' + $k.Name) -Value $k.Value }}; "
+            f"$out = & $p.command @($p.args) 2>&1 | Out-String; @{{ exit = $LASTEXITCODE; out = $out }} }}; "
+            f"$r | ConvertTo-Json -Compress"
+        )
+        try:
+            result = await _run_ps(script, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return {"exit_code": -1, "stdout": "", "stderr": "timed out", "timed_out": True}
+        data = json.loads(result.stdout or "{}")
+        return {"exit_code": int(data.get("exit") or 0), "stdout": data.get("out") or "", "stderr": "", "timed_out": False}
 
     async def guest_info(self, name: str) -> VMGuestInfo:
         """Get guest info via PowerShell Direct."""
         info = VMGuestInfo()
 
-        result = _run_ps(
-            f"Get-VM -Name '{name}' | Select-Object NetworkAdapters | "
+        result = await _run_ps(
+            f"Get-VM -Name {ps_quote(name)} | Select-Object NetworkAdapters | "
             f"ForEach-Object {{ $_.NetworkAdapters.IPAddresses }}"
         )
         if result.returncode == 0:
@@ -386,10 +403,10 @@ class HyperVBackend(HypervisorBackend):
     async def list_snapshots(self, name: str) -> list[VMSnapshot]:
         """List all snapshots for a Hyper-V VM."""
         if not await self.find_vm(name):
-            raise VMNotFoundError(f"VM '{name}' not found")
+            raise VMNotFoundError(f"VM {ps_quote(name)} not found")
 
-        result = _run_ps(
-            f"Get-VMSnapshot -VMName '{name}' | Select-Object Name, CreationTime, ParentSnapshotName | ConvertTo-Json"
+        result = await _run_ps(
+            f"Get-VMSnapshot -VMName {ps_quote(name)} | Select-Object Name, @{{n='CreationTime';e={{$_.CreationTime.ToString('o')}}}}, ParentSnapshotName | ConvertTo-Json"
         )
         snapshots = []
         if result.returncode == 0:
@@ -412,9 +429,9 @@ class HyperVBackend(HypervisorBackend):
                               include_memory: bool = False) -> VMSnapshot:
         """Create a Hyper-V snapshot."""
         if not await self.find_vm(name):
-            raise VMNotFoundError(f"VM '{name}' not found")
+            raise VMNotFoundError(f"VM {ps_quote(name)} not found")
 
-        _run_ps(f"Checkpoint-VM -Name '{name}' -SnapshotName '{snapshot_name}'", timeout=60)
+        await _run_ps(f"Checkpoint-VM -Name {ps_quote(name)} -SnapshotName {ps_quote(snapshot_name)}", timeout=60)
         return VMSnapshot(
             name=snapshot_name,
             description=description,
@@ -424,24 +441,24 @@ class HyperVBackend(HypervisorBackend):
     async def restore_snapshot(self, name: str, snapshot_name: str) -> None:
         """Restore a Hyper-V snapshot."""
         if not await self.find_vm(name):
-            raise VMNotFoundError(f"VM '{name}' not found")
-        _run_ps(f"Restore-VMSnapshot -VMName '{name}' -Name '{snapshot_name}' -Confirm:$false", timeout=60)
+            raise VMNotFoundError(f"VM {ps_quote(name)} not found")
+        await _run_ps(f"Restore-VMSnapshot -VMName {ps_quote(name)} -Name {ps_quote(snapshot_name)} -Confirm:$false", timeout=60)
 
     async def delete_snapshot(self, name: str, snapshot_name: str) -> None:
         """Delete a Hyper-V snapshot."""
         if not await self.find_vm(name):
-            raise VMNotFoundError(f"VM '{name}' not found")
-        _run_ps(f"Remove-VMSnapshot -VMName '{name}' -Name '{snapshot_name}' -Confirm:$false", timeout=60)
+            raise VMNotFoundError(f"VM {ps_quote(name)} not found")
+        await _run_ps(f"Remove-VMSnapshot -VMName {ps_quote(name)} -Name {ps_quote(snapshot_name)} -Confirm:$false", timeout=60)
 
     # ── Network ──────────────────────────────────────────────────────────────
 
     async def list_network_interfaces(self, name: str) -> list[VMNetwork]:
         """List network interfaces for a Hyper-V VM."""
         if not await self.find_vm(name):
-            raise VMNotFoundError(f"VM '{name}' not found")
+            raise VMNotFoundError(f"VM {ps_quote(name)} not found")
 
-        result = _run_ps(
-            f"Get-VMNetworkAdapter -VMName '{name}' | Select-Object Name, "
+        result = await _run_ps(
+            f"Get-VMNetworkAdapter -VMName {ps_quote(name)} | Select-Object Name, "
             f"MacAddress, SwitchName, IPAddresses, Status | ConvertTo-Json"
         )
         interfaces = []
@@ -469,14 +486,14 @@ class HyperVBackend(HypervisorBackend):
                         format: str = "qcow2") -> None:
         """Export a Hyper-V VM."""
         if not await self.find_vm(name):
-            raise VMNotFoundError(f"VM '{name}' not found")
-        _run_ps(f"Export-VM -Name '{name}' -Path '{output_path}'", timeout=120)
+            raise VMNotFoundError(f"VM {ps_quote(name)} not found")
+        await _run_ps(f"Export-VM -Name {ps_quote(name)} -Path {ps_quote(output_path)}", timeout=120)
 
     async def import_vm(self, input_path: str,
                         new_name: str | None = None) -> str:
         """Import a Hyper-V VM."""
-        name_param = f"-VMName '{new_name}'" if new_name else ""
-        _run_ps(f"Import-VM -Path '{input_path}' {name_param}", timeout=120)
+        name_param = f"-VMName {ps_quote(new_name)}" if new_name else ""
+        await _run_ps(f"Import-VM -Path {ps_quote(input_path)} {name_param}", timeout=120)
         return new_name or "imported-vm"
 
     # ── Resource Limits ─────────────────────────────────────────────────────
@@ -488,23 +505,23 @@ class HyperVBackend(HypervisorBackend):
                                  io_bandwidth_mbps: int = 0) -> None:
         """Set resource limits for a Hyper-V VM."""
         if not await self.find_vm(name):
-            raise VMNotFoundError(f"VM '{name}' not found")
+            raise VMNotFoundError(f"VM {ps_quote(name)} not found")
 
         if max_ram_mb > 0:
-            _run_ps(
-                f"Set-VMMemory -VMName '{name}' -MaximumBytes {max_ram_mb}MB"
+            await _run_ps(
+                f"Set-VMMemory -VMName {ps_quote(name)} -MaximumBytes {max_ram_mb}MB"
             )
         if max_cpus > 0:
-            _run_ps(f"Set-VMProcessor -VMName '{name}' -Count {max_cpus}")
+            await _run_ps(f"Set-VMProcessor -VMName {ps_quote(name)} -Count {max_cpus}")
         if cpu_shares > 0:
-            _run_ps(f"Set-VMProcessor -VMName '{name}' -RelativeWeight {cpu_shares}")
+            await _run_ps(f"Set-VMProcessor -VMName {ps_quote(name)} -RelativeWeight {cpu_shares}")
 
     # ── Metrics ──────────────────────────────────────────────────────────────
 
     async def get_metrics(self, name: str) -> VMMetrics:
         """Get real-time metrics for a Hyper-V VM."""
-        result = _run_ps(
-            f"Get-VM -Name '{name}' | Select-Object CPUUsage, MemoryAssigned, "
+        result = await _run_ps(
+            f"Get-VM -Name {ps_quote(name)} | Select-Object CPUUsage, MemoryAssigned, "
             f"MemoryDemand, Uptime | ConvertTo-Json"
         )
         metrics = VMMetrics(timestamp=datetime.now().isoformat())
@@ -525,15 +542,18 @@ class HyperVBackend(HypervisorBackend):
                        snapshots: bool = False) -> str:
         """Clone a Hyper-V VM."""
         if not await self.find_vm(name):
-            raise VMNotFoundError(f"VM '{name}' not found")
+            raise VMNotFoundError(f"VM {ps_quote(name)} not found")
 
-        # Export and re-import
-        export_path = str(Path(self._default_vhd_path) / "exports" / new_name)
-        os.makedirs(export_path, exist_ok=True)
-        await self.export_vm(name, export_path)
-        result = _run_ps(f"Import-VM -Path '{export_path}\\Virtual Machines\\*.vmcx' -VMName '{new_name}' -VhdDestinationPath '{self._default_vhd_path}\\{new_name}'", timeout=120)
-
-        if result.returncode != 0:
-            raise HypervisorError(f"Clone failed: {result.stderr}")
-
+        # Export, then import a copy with a new id under the new name
+        export_path = Path(self._default_vhd_path) / "exports" / new_name
+        export_path.mkdir(parents=True, exist_ok=True)
+        await self.export_vm(name, str(export_path))
+        await _run_ps(
+            f"$vmcx = Get-ChildItem -Path {ps_quote(str(export_path))} -Recurse -Filter *.vmcx | Select-Object -First 1; "
+            f"$vm = Import-VM -Path $vmcx.FullName -Copy -GenerateNewId "
+            f"-VirtualMachinePath {ps_quote(str(Path(self._default_vhd_path) / new_name))} "
+            f"-VhdDestinationPath {ps_quote(str(Path(self._default_vhd_path) / new_name))}; "
+            f"Rename-VM -VM $vm -NewName {ps_quote(new_name)}",
+            timeout=1800,
+        )
         return new_name

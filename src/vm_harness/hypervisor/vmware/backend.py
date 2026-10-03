@@ -20,6 +20,8 @@ import platform
 import re
 import shutil
 import subprocess
+
+from vm_harness import _proc
 # Suppress CLI console windows on Windows
 CREATE_NO_WINDOW = 0x08000000
 from datetime import datetime
@@ -29,6 +31,9 @@ from typing import Any
 from vm_harness.hypervisor.backend import (
     BackendNotAvailableError,
     HypervisorBackend,
+    HypervisorError,
+    OperationNotSupportedError,
+    VMAlreadyRunningError,
     VMConfig,
     VMConsole,
     VMDisplay,
@@ -39,7 +44,6 @@ from vm_harness.hypervisor.backend import (
     VMNetworkMode,
     VMNotFoundError,
     VMNotRunningError,
-    OperationNotSupportedError,
     VMSnapshot,
     VMState,
     VMStatus,
@@ -210,12 +214,12 @@ class VMwareBackend(HypervisorBackend):
         vmx_path = config["vmx_path"]
 
         if headless:
-            subprocess.run(
+            await _proc.run(
                 [self._vmrun_path, "start", vmx_path, "nogui"],
                 check=True, capture_output=True, text=True, timeout=30
             )
         else:
-            subprocess.run(
+            await _proc.run(
                 [self._vmrun_path, "start", vmx_path],
                 check=True, capture_output=True, text=True, timeout=30
             )
@@ -227,7 +231,7 @@ class VMwareBackend(HypervisorBackend):
         vmx_path = config["vmx_path"]
 
         mode = "hard" if force else "soft"
-        subprocess.run(
+        await _proc.run(
             [self._vmrun_path, "stop", vmx_path, mode],
             check=True, capture_output=True, text=True, timeout=30
         )
@@ -237,7 +241,7 @@ class VMwareBackend(HypervisorBackend):
         """Pause a running VMware VM."""
         config = await self._require_vm(name)
         vmx_path = config["vmx_path"]
-        subprocess.run(
+        await _proc.run(
             [self._vmrun_path, "pause", vmx_path],
             check=True, capture_output=True, text=True, timeout=30
         )
@@ -246,7 +250,7 @@ class VMwareBackend(HypervisorBackend):
         """Resume a paused VMware VM."""
         config = await self._require_vm(name)
         vmx_path = config["vmx_path"]
-        subprocess.run(
+        await _proc.run(
             [self._vmrun_path, "unpause", vmx_path],
             check=True, capture_output=True, text=True, timeout=30
         )
@@ -255,7 +259,7 @@ class VMwareBackend(HypervisorBackend):
         """Hard reset a VMware VM."""
         config = await self._require_vm(name)
         vmx_path = config["vmx_path"]
-        subprocess.run(
+        await _proc.run(
             [self._vmrun_path, "reset", vmx_path, "hard"],
             check=True, capture_output=True, text=True, timeout=30
         )
@@ -265,7 +269,7 @@ class VMwareBackend(HypervisorBackend):
         config = await self._require_vm(name)
         vmx_path = config["vmx_path"]
         mode = "soft" if graceful else "hard"
-        subprocess.run(
+        await _proc.run(
             [self._vmrun_path, "reset", vmx_path, mode],
             check=True, capture_output=True, text=True, timeout=30
         )
@@ -274,7 +278,7 @@ class VMwareBackend(HypervisorBackend):
         """Gracefully shut down the guest via VMware Tools."""
         config = await self._require_vm(name)
         vmx_path = config["vmx_path"]
-        subprocess.run(
+        await _proc.run(
             [self._vmrun_path, "stop", vmx_path, "soft"],
             check=True, capture_output=True, text=True, timeout=timeout
         )
@@ -332,7 +336,7 @@ class VMwareBackend(HypervisorBackend):
         vmx_path = config["vmx_path"]
 
         cmd_args = [command] + (args or [])
-        result = subprocess.run(
+        result = await _proc.run(
             [self._vmrun_path, "runProgramInGuest", vmx_path,
              "-noWait", "-activeWindow", "-interactive"] + cmd_args,
             capture_output=capture_output, text=True, timeout=timeout
@@ -348,7 +352,7 @@ class VMwareBackend(HypervisorBackend):
         """Get guest info via VMware Tools."""
         config = await self._require_vm(name)
         vmx_path = config["vmx_path"]
-        result = subprocess.run(
+        result = await _proc.run(
             [self._vmrun_path, "getGuestIPAddress", vmx_path],
             capture_output=True, text=True, timeout=10
         )
@@ -362,7 +366,7 @@ class VMwareBackend(HypervisorBackend):
         """Read a file from inside the VMware guest."""
         config = await self._require_vm(name)
         vmx_path = config["vmx_path"]
-        result = subprocess.run(
+        result = await _proc.run(
             [self._vmrun_path, "CopyFileFromGuestToHost", vmx_path, path, "/tmp/vmware_guest_file"],
             capture_output=True, text=True, timeout=10
         )
@@ -380,7 +384,7 @@ class VMwareBackend(HypervisorBackend):
         tmp_path = f"/tmp/vmware_host_file_{Path(path).name}"
         with open(tmp_path, "wb") as f:
             f.write(data)
-        subprocess.run(
+        await _proc.run(
             [self._vmrun_path, "CopyFileFromHostToGuest", vmx_path, tmp_path, path],
             check=True, capture_output=True, text=True, timeout=10
         )
@@ -391,7 +395,7 @@ class VMwareBackend(HypervisorBackend):
         """List all snapshots for a VMware VM."""
         config = await self._require_vm(name)
         vmx_path = config["vmx_path"]
-        result = subprocess.run(
+        result = await _proc.run(
             [self._vmrun_path, "listSnapshots", vmx_path],
             capture_output=True, text=True, timeout=10
         )
@@ -409,7 +413,7 @@ class VMwareBackend(HypervisorBackend):
         """Create a VMware snapshot."""
         config = await self._require_vm(name)
         vmx_path = config["vmx_path"]
-        subprocess.run(
+        await _proc.run(
             [self._vmrun_path, "snapshot", vmx_path, snapshot_name],
             check=True, capture_output=True, text=True, timeout=30
         )
@@ -423,7 +427,7 @@ class VMwareBackend(HypervisorBackend):
         """Restore a VMware snapshot."""
         config = await self._require_vm(name)
         vmx_path = config["vmx_path"]
-        subprocess.run(
+        await _proc.run(
             [self._vmrun_path, "revertToSnapshot", vmx_path, snapshot_name],
             check=True, capture_output=True, text=True, timeout=30
         )
@@ -432,7 +436,7 @@ class VMwareBackend(HypervisorBackend):
         """Delete a VMware snapshot."""
         config = await self._require_vm(name)
         vmx_path = config["vmx_path"]
-        subprocess.run(
+        await _proc.run(
             [self._vmrun_path, "deleteSnapshot", vmx_path, snapshot_name],
             check=True, capture_output=True, text=True, timeout=30
         )
@@ -450,7 +454,7 @@ class VMwareBackend(HypervisorBackend):
         new_vmx = str(new_dir / f"{new_name}.vmx")
 
         clone_mode = "linked" if linked else "full"
-        subprocess.run(
+        await _proc.run(
             [self._vmrun_path, "clone", vmx_path, new_vmx, clone_mode],
             check=True, capture_output=True, text=True, timeout=120
         )
@@ -496,7 +500,7 @@ class VMwareBackend(HypervisorBackend):
 
     async def _get_running_vmx_paths(self) -> set[str]:
         """Get the set of currently running VMX paths."""
-        result = subprocess.run(
+        result = await _proc.run(
             [self._vmrun_path, "list"],
             capture_output=True, text=True, timeout=10
         )
@@ -512,7 +516,7 @@ class VMwareBackend(HypervisorBackend):
         """Create a VMDK disk using vmware-vdiskmanager or qemu-img fallback."""
         vdisk_manager = str(Path(self._vmrun_path).parent / "vmware-vdiskmanager.exe")
         if os.path.isfile(vdisk_manager):
-            subprocess.run(
+            await _proc.run(
                 [vdisk_manager, "-c", "-s", f"{size_gb}GB", "-a", "lsilogic",
                  "-t", "0", path],
                 check=True, capture_output=True, text=True, timeout=60
@@ -520,7 +524,7 @@ class VMwareBackend(HypervisorBackend):
         else:
             # Fallback: use qemu-img
             try:
-                subprocess.run(
+                await _proc.run(
                     ["qemu-img", "create", "-f", "vmdk", path, f"{size_gb}G"],
                     check=True, capture_output=True, text=True, timeout=30
                 )

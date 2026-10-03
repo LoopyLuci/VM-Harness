@@ -18,6 +18,7 @@ sys.path.insert(0, 'src')
 sys.path.insert(0, '.')
 
 from PyQt5.QtWidgets import QApplication
+import pytest
 app = QApplication.instance() or QApplication(sys.argv)
 
 
@@ -125,6 +126,7 @@ class TestSSHFailurePaths(unittest.TestCase):
             pass  # Expected if SSH not running
 
 
+@pytest.mark.xdist_group("plugins")  # loads plugins by module name, like tests/test_plugin_*.py
 class TestConcurrencyEdgeCases(unittest.TestCase):
     """Test concurrent access patterns."""
 

@@ -20,6 +20,8 @@ import platform
 import re
 import shutil
 import subprocess
+
+from vm_harness import _proc
 # Suppress CLI console windows on Windows
 CREATE_NO_WINDOW = 0x08000000
 from datetime import datetime
@@ -29,6 +31,9 @@ from typing import Any
 from vm_harness.hypervisor.backend import (
     BackendNotAvailableError,
     HypervisorBackend,
+    HypervisorError,
+    OperationNotSupportedError,
+    VMAlreadyRunningError,
     VMConfig,
     VMConsole,
     VMDisplay,
@@ -39,7 +44,6 @@ from vm_harness.hypervisor.backend import (
     VMNetworkMode,
     VMNotFoundError,
     VMNotRunningError,
-    OperationNotSupportedError,
     VMSnapshot,
     VMState,
     VMStatus,
@@ -134,7 +138,7 @@ class VirtualBoxBackend(HypervisorBackend):
 
     async def list_vms(self) -> list[str]:
         """List all VirtualBox VM names."""
-        result = subprocess.run(
+        result = await _proc.run(
             [self._vboxmanage_path, "list", "vms"],
             capture_output=True, text=True, timeout=10
         )
@@ -143,7 +147,9 @@ class VirtualBoxBackend(HypervisorBackend):
             for line in result.stdout.split("\n"):
                 match = re.match(r'"(.+)"\s+\{(.+)\}', line.strip())
                 if match:
-                    vms.append(match.group(1))
+                    # A registration whose files are gone is listed as "<inaccessible>": name it by its UUID, which
+                    # VBoxManage accepts anywhere a name goes, so it can still be inspected or unregistered.
+                    vms.append(match.group(2) if match.group(1) == "<inaccessible>" else match.group(1))
         return vms
 
     # ── VM Lifecycle ─────────────────────────────────────────────────────────
@@ -154,7 +160,7 @@ class VirtualBoxBackend(HypervisorBackend):
             raise VMAlreadyRunningError(f"VM '{config.name}' already exists")
 
         # Create VM
-        subprocess.run(
+        await _proc.run(
             [self._vboxmanage_path, "createvm", "--name", config.name,
              "--ostype", "Ubuntu_64", "--register"],
             check=True, capture_output=True, text=True, timeout=30
@@ -171,25 +177,25 @@ class VirtualBoxBackend(HypervisorBackend):
         ]
         if config.enable_nested_virt:
             modify_args.extend(["--nested-hw-virt", "on"])
-        subprocess.run(modify_args, check=True, capture_output=True, text=True, timeout=10, creationflags=CREATE_NO_WINDOW)
+        await _proc.run(modify_args, check=True, capture_output=True, text=True, timeout=10, creationflags=CREATE_NO_WINDOW)
 
         # Set firmware
         if config.boot_firmware == "uefi":
-            subprocess.run(
+            await _proc.run(
                 [self._vboxmanage_path, "modifyvm", config.name, "--firmware", "efi"],
                 check=True, capture_output=True, text=True, timeout=10
             )
 
         # Set network
         network_mode = config.network_mode.value if config.network_mode else self._default_network
-        subprocess.run(
+        await _proc.run(
             [self._vboxmanage_path, "modifyvm", config.name,
              "--nic1", network_mode],
             check=True, capture_output=True, text=True, timeout=10
         )
 
         # Create storage controller
-        subprocess.run(
+        await _proc.run(
             [self._vboxmanage_path, "storagectl", config.name, "--name", "SATA",
              "--add", "sata", "--controller", "IntelAhci"],
             check=True, capture_output=True, text=True, timeout=10
@@ -199,13 +205,13 @@ class VirtualBoxBackend(HypervisorBackend):
         if config.disk_path:
             disk_path = config.disk_path
             if not os.path.isfile(disk_path) and config.disk_size_gb > 0:
-                subprocess.run(
+                await _proc.run(
                     [self._vboxmanage_path, "createmedium", "disk",
                      "--filename", disk_path, "--size", str(config.disk_size_gb * 1024),
                      "--format", "VDI"],
                     check=True, capture_output=True, text=True, timeout=60
                 )
-            subprocess.run(
+            await _proc.run(
                 [self._vboxmanage_path, "storageattach", config.name,
                  "--storagectl", "SATA", "--port", "0", "--device", "0",
                  "--type", "hdd", "--medium", disk_path],
@@ -213,13 +219,13 @@ class VirtualBoxBackend(HypervisorBackend):
             )
 
         # CD-ROM
-        subprocess.run(
+        await _proc.run(
             [self._vboxmanage_path, "storagectl", config.name, "--name", "IDE",
              "--add", "ide"],
             check=True, capture_output=True, text=True, timeout=10
         )
         if config.iso_path:
-            subprocess.run(
+            await _proc.run(
                 [self._vboxmanage_path, "storageattach", config.name,
                  "--storagectl", "IDE", "--port", "0", "--device", "0",
                  "--type", "dvddrive", "--medium", config.iso_path],
@@ -250,14 +256,14 @@ class VirtualBoxBackend(HypervisorBackend):
 
         # Power off if running
         try:
-            subprocess.run(
+            await _proc.run(
                 [self._vboxmanage_path, "controlvm", name, "poweroff"],
                 capture_output=True, text=True, timeout=10
             )
         except Exception:
             pass
 
-        subprocess.run(
+        await _proc.run(
             [self._vboxmanage_path, "unregistervm", name, "--delete"],
             check=True, capture_output=True, text=True, timeout=30
         )
@@ -275,7 +281,7 @@ class VirtualBoxBackend(HypervisorBackend):
             raise VMNotFoundError(f"VM '{name}' not found")
 
         mode = "headless" if headless else "gui"
-        subprocess.run(
+        await _proc.run(
             [self._vboxmanage_path, "startvm", name, "--type", mode],
             check=True, capture_output=True, text=True, timeout=30
         )
@@ -287,12 +293,12 @@ class VirtualBoxBackend(HypervisorBackend):
             raise VMNotFoundError(f"VM '{name}' not found")
 
         if force:
-            subprocess.run(
+            await _proc.run(
                 [self._vboxmanage_path, "controlvm", name, "poweroff"],
                 check=True, capture_output=True, text=True, timeout=30
             )
         else:
-            subprocess.run(
+            await _proc.run(
                 [self._vboxmanage_path, "controlvm", name, "acpipowerbutton"],
                 check=True, capture_output=True, text=True, timeout=30
             )
@@ -302,7 +308,7 @@ class VirtualBoxBackend(HypervisorBackend):
         """Pause a running VirtualBox VM."""
         if not await self.find_vm(name):
             raise VMNotFoundError(f"VM '{name}' not found")
-        subprocess.run(
+        await _proc.run(
             [self._vboxmanage_path, "controlvm", name, "pause"],
             check=True, capture_output=True, text=True, timeout=10
         )
@@ -311,7 +317,7 @@ class VirtualBoxBackend(HypervisorBackend):
         """Resume a paused VirtualBox VM."""
         if not await self.find_vm(name):
             raise VMNotFoundError(f"VM '{name}' not found")
-        subprocess.run(
+        await _proc.run(
             [self._vboxmanage_path, "controlvm", name, "resume"],
             check=True, capture_output=True, text=True, timeout=10
         )
@@ -320,7 +326,7 @@ class VirtualBoxBackend(HypervisorBackend):
         """Hard reset a VirtualBox VM."""
         if not await self.find_vm(name):
             raise VMNotFoundError(f"VM '{name}' not found")
-        subprocess.run(
+        await _proc.run(
             [self._vboxmanage_path, "controlvm", name, "reset"],
             check=True, capture_output=True, text=True, timeout=10
         )
@@ -330,12 +336,12 @@ class VirtualBoxBackend(HypervisorBackend):
         if not await self.find_vm(name):
             raise VMNotFoundError(f"VM '{name}' not found")
         if graceful:
-            subprocess.run(
+            await _proc.run(
                 [self._vboxmanage_path, "controlvm", name, "acpipowerbutton"],
                 check=True, capture_output=True, text=True, timeout=10
             )
         else:
-            subprocess.run(
+            await _proc.run(
                 [self._vboxmanage_path, "controlvm", name, "reset"],
                 check=True, capture_output=True, text=True, timeout=10
             )
@@ -344,7 +350,7 @@ class VirtualBoxBackend(HypervisorBackend):
         """Gracefully shut down the guest via ACPI."""
         if not await self.find_vm(name):
             raise VMNotFoundError(f"VM '{name}' not found")
-        subprocess.run(
+        await _proc.run(
             [self._vboxmanage_path, "controlvm", name, "acpipowerbutton"],
             check=True, capture_output=True, text=True, timeout=timeout
         )
@@ -356,12 +362,15 @@ class VirtualBoxBackend(HypervisorBackend):
         if not await self.find_vm(name):
             raise VMNotFoundError(f"VM '{name}' not found")
 
-        result = subprocess.run(
+        result = await _proc.run(
             [self._vboxmanage_path, "showvminfo", name, "--machinereadable"],
             capture_output=True, text=True, timeout=10
         )
 
         status = VMStatus(name=name, backend_name=self.default_name)
+        if result.returncode != 0:
+            status.state = VMState.ERROR
+            status.last_error = (result.stderr or result.stdout).strip().splitlines()[0][:300] if (result.stderr or result.stdout).strip() else "inaccessible"
 
         if result.returncode == 0:
             vm_info = self._parse_showvminfo(result.stdout)
@@ -371,8 +380,15 @@ class VirtualBoxBackend(HypervisorBackend):
                 "saved": VMState.SUSPENDED,
                 "running": VMState.RUNNING,
                 "paused": VMState.PAUSED,
+                "aborted": VMState.STOPPED,
+                "starting": VMState.STARTING,
+                "stopping": VMState.STOPPING,
+                "saving": VMState.STOPPING,
+                "restoring": VMState.RESTORING,
             }
             status.state = state_map.get(state, VMState.UNKNOWN)
+            if vm_info.get("VMStateChangeTime") and status.state == VMState.RUNNING:
+                status.started_at = vm_info["VMStateChangeTime"]
             status.ram_allocated_mb = int(vm_info.get("memory", 0))
             status.cpus_allocated = int(vm_info.get("cpus", 0))
             status.pid = int(vm_info.get("VMProcessPID", 0)) if "VMProcessPID" in vm_info else 0
@@ -383,7 +399,7 @@ class VirtualBoxBackend(HypervisorBackend):
         """Get the configuration of a VirtualBox VM."""
         if not await self.find_vm(name):
             return None
-        result = subprocess.run(
+        result = await _proc.run(
             [self._vboxmanage_path, "showvminfo", name, "--machinereadable"],
             capture_output=True, text=True, timeout=10
         )
@@ -405,7 +421,7 @@ class VirtualBoxBackend(HypervisorBackend):
         display.host = "127.0.0.1"
         display.port = 5900
 
-        result = subprocess.run(
+        result = await _proc.run(
             [self._vboxmanage_path, "showvminfo", name, "--machinereadable"],
             capture_output=True, text=True, timeout=10
         )
@@ -420,7 +436,7 @@ class VirtualBoxBackend(HypervisorBackend):
 
     async def screenshot(self, name: str) -> bytes:
         """Capture a screenshot from a VirtualBox VM."""
-        result = subprocess.run(
+        result = await _proc.run(
             [self._vboxmanage_path, "controlvm", name, "screenshotpng", "/tmp/vbox_screenshot.png"],
             capture_output=True, text=True, timeout=10
         )
@@ -446,7 +462,7 @@ class VirtualBoxBackend(HypervisorBackend):
         if args:
             guest_args.extend(["--"] + args)
 
-        result = subprocess.run(
+        result = await _proc.run(
             guest_args, capture_output=capture_output, text=True, timeout=timeout
         )
         return {
@@ -459,7 +475,7 @@ class VirtualBoxBackend(HypervisorBackend):
     async def guest_info(self, name: str) -> VMGuestInfo:
         """Get guest info via VirtualBox guest properties."""
         info = VMGuestInfo()
-        result = subprocess.run(
+        result = await _proc.run(
             [self._vboxmanage_path, "guestproperty", "get", name, "/VirtualBox/GuestInfo/OS/Name"],
             capture_output=True, text=True, timeout=10
         )
@@ -471,7 +487,7 @@ class VirtualBoxBackend(HypervisorBackend):
                               offset: int = 0,
                               max_bytes: int = 65536) -> bytes:
         """Read a file from inside the VirtualBox guest."""
-        subprocess.run(
+        await _proc.run(
             [self._vboxmanage_path, "guestcontrol", name, "copyfrom",
              "--target-directory", "/tmp", path],
             capture_output=True, text=True, timeout=10
@@ -488,7 +504,7 @@ class VirtualBoxBackend(HypervisorBackend):
         tmp_path = f"/tmp/vbox_host_file_{Path(path).name}"
         with open(tmp_path, "wb") as f:
             f.write(data)
-        subprocess.run(
+        await _proc.run(
             [self._vboxmanage_path, "guestcontrol", name, "copyto",
              "--target-directory", path, tmp_path],
             check=True, capture_output=True, text=True, timeout=10
@@ -501,7 +517,7 @@ class VirtualBoxBackend(HypervisorBackend):
         if not await self.find_vm(name):
             raise VMNotFoundError(f"VM '{name}' not found")
 
-        result = subprocess.run(
+        result = await _proc.run(
             [self._vboxmanage_path, "snapshot", name, "list", "--machinereadable"],
             capture_output=True, text=True, timeout=10
         )
@@ -522,7 +538,7 @@ class VirtualBoxBackend(HypervisorBackend):
         if not await self.find_vm(name):
             raise VMNotFoundError(f"VM '{name}' not found")
 
-        subprocess.run(
+        await _proc.run(
             [self._vboxmanage_path, "snapshot", name, "take", snapshot_name,
              "--description", description],
             check=True, capture_output=True, text=True, timeout=60
@@ -537,7 +553,7 @@ class VirtualBoxBackend(HypervisorBackend):
         """Restore a VirtualBox snapshot."""
         if not await self.find_vm(name):
             raise VMNotFoundError(f"VM '{name}' not found")
-        subprocess.run(
+        await _proc.run(
             [self._vboxmanage_path, "snapshot", name, "restore", snapshot_name],
             check=True, capture_output=True, text=True, timeout=60
         )
@@ -546,7 +562,7 @@ class VirtualBoxBackend(HypervisorBackend):
         """Delete a VirtualBox snapshot."""
         if not await self.find_vm(name):
             raise VMNotFoundError(f"VM '{name}' not found")
-        subprocess.run(
+        await _proc.run(
             [self._vboxmanage_path, "snapshot", name, "delete", snapshot_name],
             check=True, capture_output=True, text=True, timeout=60
         )
@@ -561,7 +577,7 @@ class VirtualBoxBackend(HypervisorBackend):
             raise VMNotFoundError(f"No disk path for VM '{name}'")
 
         # Must be VDI format for resize
-        subprocess.run(
+        await _proc.run(
             [self._vboxmanage_path, "modifymedium", "disk", disk_path,
              "--resize", str(new_size_gb * 1024)],
             check=True, capture_output=True, text=True, timeout=60
@@ -571,7 +587,7 @@ class VirtualBoxBackend(HypervisorBackend):
         """Eject the virtual CD-ROM."""
         if not await self.find_vm(name):
             raise VMNotFoundError(f"VM '{name}' not found")
-        subprocess.run(
+        await _proc.run(
             [self._vboxmanage_path, "storageattach", name,
              "--storagectl", "IDE", "--port", "0", "--device", "0",
              "--type", "dvddrive", "--medium", "emptydrive"],
@@ -582,7 +598,7 @@ class VirtualBoxBackend(HypervisorBackend):
         """Insert an ISO into the virtual CD-ROM."""
         if not await self.find_vm(name):
             raise VMNotFoundError(f"VM '{name}' not found")
-        subprocess.run(
+        await _proc.run(
             [self._vboxmanage_path, "storageattach", name,
              "--storagectl", "IDE", "--port", "0", "--device", "0",
              "--type", "dvddrive", "--medium", iso_path],
@@ -600,7 +616,7 @@ class VirtualBoxBackend(HypervisorBackend):
 
         mode = "--mode" if linked else "--mode"
         link_arg = "machineandchildren" if linked else "all"
-        subprocess.run(
+        await _proc.run(
             [self._vboxmanage_path, "clonevm", name, "--name", new_name,
              "--register", mode, link_arg],
             check=True, capture_output=True, text=True, timeout=120
@@ -624,7 +640,7 @@ class VirtualBoxBackend(HypervisorBackend):
         if not await self.find_vm(name):
             raise VMNotFoundError(f"VM '{name}' not found")
 
-        result = subprocess.run(
+        result = await _proc.run(
             [self._vboxmanage_path, "showvminfo", name, "--machinereadable"],
             capture_output=True, text=True, timeout=10
         )
@@ -649,7 +665,7 @@ class VirtualBoxBackend(HypervisorBackend):
         if not await self.find_vm(name):
             raise VMNotFoundError(f"VM '{name}' not found")
         # Create USB filter
-        subprocess.run(
+        await _proc.run(
             [self._vboxmanage_path, "usbfilter", "add", "0", "--target", name,
              "--name", f"USB-{vendor_id}-{product_id}",
              "--vendorid", vendor_id, "--productid", product_id],
@@ -661,7 +677,7 @@ class VirtualBoxBackend(HypervisorBackend):
         """Detach a USB device from a VirtualBox VM."""
         if not await self.find_vm(name):
             raise VMNotFoundError(f"VM '{name}' not found")
-        subprocess.run(
+        await _proc.run(
             [self._vboxmanage_path, "usbfilter", "remove", "0", "--target", name],
             check=True, capture_output=True, text=True, timeout=10
         )
@@ -673,7 +689,7 @@ class VirtualBoxBackend(HypervisorBackend):
         """Export a VirtualBox VM as OVA."""
         if not await self.find_vm(name):
             raise VMNotFoundError(f"VM '{name}' not found")
-        subprocess.run(
+        await _proc.run(
             [self._vboxmanage_path, "export", name, "--output", output_path],
             check=True, capture_output=True, text=True, timeout=120
         )
@@ -684,7 +700,7 @@ class VirtualBoxBackend(HypervisorBackend):
         args = [self._vboxmanage_path, "import", input_path]
         if new_name:
             args.extend(["--vsys", "0", "--vmname", new_name])
-        result = subprocess.run(
+        result = await _proc.run(
             args, capture_output=True, text=True, timeout=120
         )
         if result.returncode != 0:

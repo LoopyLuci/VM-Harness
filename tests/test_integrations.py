@@ -303,43 +303,34 @@ class QEMUIntegrationTest(unittest.TestCase):
             self.assertIn(status, ["running", "stopped", "paused", "error", "unknown"])
 
     def test_03_vm_lifecycle(self):
-        """Test VM lifecycle: start, stop, snapshot."""
-        # Use first available VM or create one
+        """Start and stop the test's own VM. It never touches the user's VMs, and whatever happens the VM is stopped
+        afterwards: a VM left running under WHPX can stop other VMs (WSL's among them) from starting."""
+        name = "vmharness-test-vm"
         try:
-            vms = self.backend.list_vms()
-            if not vms:
-                # Create a test VM
+            names = [v if isinstance(v, str) else v.get("name", "") for v in self.backend.list_vms()]
+            if name not in names:
                 from vm_harness.hypervisor.backend import VMConfig
-                config = VMConfig(
-                    name="vmharness-test-vm",
-                    ram_mb=512,
-                    cpus=1,
-                    disk_size_gb=1,
-                    disk_format="qcow2",
-                )
-                self.backend.create_vm(config)
-                vms = self.backend.list_vms()
-            if not vms:
-                self.skipTest("QEMU lifecycle test skipped: no VMs available")
-            vm_name = vms[0] if isinstance(vms[0], str) else vms[0].get("name", "")
-            if not vm_name:
-                self.skipTest("QEMU lifecycle test skipped: no VM name")
+                self.backend.create_vm(VMConfig(name=name, ram_mb=512, cpus=1, disk_size_gb=1, disk_format="qcow2"))
         except Exception as e:
-            self.skipTest(f"QEMU lifecycle test skipped: {e}")
+            self.skipTest(f"QEMU lifecycle test skipped: cannot create the test VM: {e}")
         try:
-            # Start (headless to avoid SPICE display hang on headless machines)
-            self.backend.start_vm(vm_name, headless=True)
+            try:
+                # headless: no display window (and no SPICE hang on headless machines)
+                self.backend.start_vm(name, headless=True)
+            except Exception as e:
+                self.skipTest(f"QEMU lifecycle test skipped: cannot start the test VM: {e}")
             time.sleep(3)
-            status = self.backend.get_status(vm_name)
-            self.assertEqual(status, "running")
-
-            # Stop
-            self.backend.stop_vm(vm_name)
+            self.assertEqual(self.backend.get_status(name), "running")
+            # force: the test VM has an empty disk and no OS, so nothing would answer a graceful (ACPI) power-down
+            self.backend.stop_vm(name, force=True)
             time.sleep(3)
-            status = self.backend.get_status(vm_name)
-            self.assertEqual(status, "stopped")
-        except Exception as e:
-            self.skipTest(f"QEMU lifecycle test skipped: {e}")
+            self.assertEqual(self.backend.get_status(name), "stopped")
+        finally:
+            try:
+                if self.backend.get_status(name) != "stopped":
+                    self.backend.stop_vm(name, force=True)
+            except Exception:
+                pass
 
     def test_04_qmp_communication(self):
         """Test QMP communication."""

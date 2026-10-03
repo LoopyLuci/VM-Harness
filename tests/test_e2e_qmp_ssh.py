@@ -21,12 +21,13 @@ os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
 
 def _qmp_port_open() -> bool:
-    """Check if QMP port 4444 is reachable (live QEMU instance)."""
+    """True only if QEMU's QMP answers on 4444: it greets with {"QMP": ...}. Another program on the port (a Java
+    service here) must not make these tests run against it."""
     try:
-        s = socket.create_connection(("127.0.0.1", 4444), timeout=2)
-        s.close()
-        return True
-    except (OSError, ConnectionRefusedError):
+        with socket.create_connection(("127.0.0.1", 4444), timeout=2) as s:
+            s.settimeout(2)
+            return b'"QMP"' in s.recv(4096)
+    except OSError:
         return False
 
 

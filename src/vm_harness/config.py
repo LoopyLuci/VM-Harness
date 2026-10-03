@@ -79,7 +79,7 @@ class VmMCPSettings(BaseSettings):
     # ── SSH (guest access) ─────────────────────────────────────────────────────
 
     ssh_host: str = Field(default="127.0.0.1", description="Guest SSH hostname")
-    ssh_port: int = Field(default=22, description="Guest SSH port", ge=1, le=65535)
+    ssh_port: int = Field(default=2222, description="Guest SSH port (QEMU user-mode NAT forwards host 2222 to guest 22)", ge=1, le=65535)
     ssh_username: str = Field(default="vmharness", description="Guest SSH username")
     ssh_timeout_sec: int = Field(default=15, description="SSH timeout in seconds", ge=1)
     ssh_keepalive_sec: int = Field(default=30, description="SSH keepalive interval", ge=0)

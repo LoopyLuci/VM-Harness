@@ -40,7 +40,7 @@ Thumbs.db
 # GUI credential store (encrypted secrets — never commit)
 .local/share/qmcmcp/
 .config/qmcmcp/
-%LOCALAPPDATA%\qmcmcp\
+qmcmcp/
 
 # Test artifacts
 .pytest_cache/
@@ -106,3 +106,8 @@ target/
 
 # Node dependencies (restore with `npm ci` in web/)
 web/node_modules/
+
+# Local CI/CD pipeline (ci/pipeline.py): its logs, reports and lock
+ci/logs/
+ci/reports/
+ci/.pipeline.lock

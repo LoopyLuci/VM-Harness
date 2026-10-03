@@ -19,6 +19,8 @@ import platform
 import re
 import shutil
 import subprocess
+
+from vm_harness import _proc
 # Suppress CLI console windows on Windows
 CREATE_NO_WINDOW = 0x08000000
 from datetime import datetime
@@ -28,6 +30,9 @@ from typing import Any
 from vm_harness.hypervisor.backend import (
     BackendNotAvailableError,
     HypervisorBackend,
+    HypervisorError,
+    OperationNotSupportedError,
+    VMAlreadyRunningError,
     VMConfig,
     VMConsole,
     VMDisplay,
@@ -38,7 +43,6 @@ from vm_harness.hypervisor.backend import (
     VMNetworkMode,
     VMNotFoundError,
     VMNotRunningError,
-    OperationNotSupportedError,
     VMSnapshot,
     VMState,
     VMStatus,
@@ -107,7 +111,7 @@ class WSLBackend(HypervisorBackend):
                 f"wsl.exe not found: {self._wsl_path}"
             )
         # Check WSL version
-        result = subprocess.run(
+        result = await _proc.run(
             [self._wsl_path, "--status"],
             capture_output=True, text=True, timeout=10
         )
@@ -123,7 +127,7 @@ class WSLBackend(HypervisorBackend):
 
     async def list_vms(self) -> list[str]:
         """List all WSL distributions."""
-        result = subprocess.run(
+        result = await _proc.run(
             [self._wsl_path, "--list", "--quiet"],
             capture_output=True, text=True, timeout=10
         )
@@ -149,13 +153,13 @@ class WSLBackend(HypervisorBackend):
 
         if config.disk_path and os.path.isfile(config.disk_path):
             # Import from tarball
-            subprocess.run(
+            await _proc.run(
                 [self._wsl_path, "--import", config.name, install_path, config.disk_path],
                 check=True, capture_output=True, text=True, timeout=120
             )
         else:
             # Install default distribution and rename
-            subprocess.run(
+            await _proc.run(
                 [self._wsl_path, "--install", "-d", self._default_distro, "--no-launch"],
                 check=True, capture_output=True, text=True, timeout=300
             )
@@ -182,14 +186,14 @@ class WSLBackend(HypervisorBackend):
 
         # Terminate first
         try:
-            subprocess.run(
+            await _proc.run(
                 [self._wsl_path, "--terminate", name],
                 capture_output=True, text=True, timeout=10
             )
         except Exception:
             pass
 
-        subprocess.run(
+        await _proc.run(
             [self._wsl_path, "--unregister", name],
             check=True, capture_output=True, text=True, timeout=30
         )
@@ -207,7 +211,7 @@ class WSLBackend(HypervisorBackend):
             raise VMNotFoundError(f"VM '{name}' not found")
 
         # WSL is always running as a lightweight VM; we just verify it works
-        result = subprocess.run(
+        result = await _proc.run(
             [self._wsl_path, "-d", name, "-e", "echo", "hello"],
             capture_output=True, text=True, timeout=30
         )
@@ -220,7 +224,7 @@ class WSLBackend(HypervisorBackend):
         if not await self.find_vm(name):
             raise VMNotFoundError(f"VM '{name}' not found")
 
-        subprocess.run(
+        await _proc.run(
             [self._wsl_path, "--terminate", name],
             check=True, capture_output=True, text=True, timeout=10
         )
@@ -246,42 +250,36 @@ class WSLBackend(HypervisorBackend):
 
     # ── Status / Info ────────────────────────────────────────────────────────
 
+    async def distributions(self) -> dict[str, dict[str, Any]]:
+        """name -> {state, version, default} from `wsl -l -v`, which reads state without starting anything."""
+        result = await _proc.run([self._wsl_path, "--list", "--verbose"], timeout=15)
+        out: dict[str, dict[str, Any]] = {}
+        for line in result.stdout.splitlines()[1:]:
+            default = line.lstrip().startswith("*")
+            parts = line.replace("*", " ", 1).split()
+            if len(parts) >= 3:
+                out[parts[0]] = {"state": parts[1], "version": int(parts[2]) if parts[2].isdigit() else 0, "default": default}
+        return out
+
     async def get_status(self, name: str) -> VMStatus:
-        """Get the status of a WSL distribution."""
-        if not await self.find_vm(name):
+        """Get the status of a WSL distribution. A stopped distribution is not started to answer."""
+        distros = await self.distributions()
+        if name not in distros:
             raise VMNotFoundError(f"VM '{name}' not found")
-
         status = VMStatus(name=name, backend_name=self.default_name)
-
-        # Check if running
-        result = subprocess.run(
-            [self._wsl_path, "--list", "--running", "--quiet"],
-            capture_output=True, text=True, timeout=10
-        )
-        if result.returncode == 0:
-            running = [line.strip() for line in result.stdout.split("\n")]
-            if name in running:
-                status.state = VMState.RUNNING
-            else:
-                status.state = VMState.STOPPED
-        else:
-            status.state = VMState.UNKNOWN
-
-        # Try to get memory info
-        try:
-            mem_result = subprocess.run(
-                [self._wsl_path, "-d", name, "-e", "free", "-m"],
-                capture_output=True, text=True, timeout=10
-            )
-            if mem_result.returncode == 0:
-                lines = mem_result.stdout.strip().split("\n")
-                if len(lines) > 1:
+        state = distros[name]["state"].lower()
+        status.state = {"running": VMState.RUNNING, "stopped": VMState.STOPPED, "installing": VMState.STARTING,
+                        "converting": VMState.STARTING, "uninstalling": VMState.STOPPING}.get(state, VMState.UNKNOWN)
+        if status.state == VMState.RUNNING:
+            try:
+                mem = await _proc.run([self._wsl_path, "-d", name, "-e", "free", "-m"], timeout=10)
+                lines = mem.stdout.strip().splitlines()
+                if mem.returncode == 0 and len(lines) > 1:
                     parts = lines[1].split()
                     status.ram_allocated_mb = int(parts[1])
                     status.ram_usage_mb = int(parts[2])
-        except Exception:
-            pass
-
+            except Exception:
+                pass
         return status
 
     async def get_config(self, name: str) -> VMConfig | None:
@@ -312,7 +310,7 @@ class WSLBackend(HypervisorBackend):
         if args:
             wsl_args.extend(args)
 
-        result = subprocess.run(
+        result = await _proc.run(
             wsl_args, capture_output=capture_output, text=True, timeout=timeout
         )
         return {
@@ -327,7 +325,7 @@ class WSLBackend(HypervisorBackend):
         info = VMGuestInfo()
 
         # Get hostname
-        result = subprocess.run(
+        result = await _proc.run(
             [self._wsl_path, "-d", name, "-e", "hostname"],
             capture_output=True, text=True, timeout=10
         )
@@ -335,7 +333,7 @@ class WSLBackend(HypervisorBackend):
             info.hostname = result.stdout.strip()
 
         # Get OS info
-        result = subprocess.run(
+        result = await _proc.run(
             [self._wsl_path, "-d", name, "-e", "uname", "-a"],
             capture_output=True, text=True, timeout=10
         )
@@ -343,7 +341,7 @@ class WSLBackend(HypervisorBackend):
             info.os_name = result.stdout.strip()
 
         # Get IP
-        result = subprocess.run(
+        result = await _proc.run(
             [self._wsl_path, "-d", name, "-e", "hostname", "-I"],
             capture_output=True, text=True, timeout=10
         )
@@ -356,7 +354,7 @@ class WSLBackend(HypervisorBackend):
                               offset: int = 0,
                               max_bytes: int = 65536) -> bytes:
         """Read a file from inside WSL."""
-        result = subprocess.run(
+        result = await _proc.run(
             [self._wsl_path, "-d", name, "-e", "cat", path],
             capture_output=True, text=False, timeout=10
         )
@@ -366,7 +364,7 @@ class WSLBackend(HypervisorBackend):
                                data: bytes, offset: int = 0) -> None:
         """Write a file to WSL."""
         # Use tee for binary-safe writing
-        result = subprocess.run(
+        result = await _proc.run(
             [self._wsl_path, "-d", name, "-e", "tee", path],
             input=data, capture_output=True, timeout=10
         )
@@ -399,7 +397,7 @@ class WSLBackend(HypervisorBackend):
         if not await self.find_vm(name):
             raise VMNotFoundError(f"VM '{name}' not found")
 
-        subprocess.run(
+        await _proc.run(
             [self._wsl_path, "--export", name, output_path],
             check=True, capture_output=True, text=True, timeout=120
         )
@@ -411,7 +409,7 @@ class WSLBackend(HypervisorBackend):
             new_name = Path(input_path).stem
 
         install_path = str(Path(self._default_disk_dir()) / new_name)
-        subprocess.run(
+        await _proc.run(
             [self._wsl_path, "--import", new_name, install_path, input_path],
             check=True, capture_output=True, text=True, timeout=120
         )
@@ -435,7 +433,7 @@ class WSLBackend(HypervisorBackend):
         metrics = VMMetrics(timestamp=datetime.now().isoformat())
 
         # CPU and memory
-        result = subprocess.run(
+        result = await _proc.run(
             [self._wsl_path, "-d", name, "-e", "cat", "/proc/meminfo"],
             capture_output=True, text=True, timeout=10
         )

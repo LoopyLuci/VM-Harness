@@ -9,12 +9,14 @@ import atexit
 import logging
 import argparse
 import time
+from pathlib import Path
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Debug logging — use fixed absolute path
+# Debug logging — resolved relative to the project, not a hardcoded machine path
 # ═══════════════════════════════════════════════════════════════════════════════
-_debug_path = r"C:\Projects\QEMU-MCP\logs\debug.log"
-os.makedirs(r"C:\Projects\QEMU-MCP\logs", exist_ok=True)
+_debug_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
+_debug_path = os.path.join(_debug_dir, "debug.log")
+os.makedirs(_debug_dir, exist_ok=True)
 
 def _log_debug(msg: str):
     try:
@@ -166,6 +168,11 @@ def main():
         os.environ["QT_QPA_PLATFORM"] = args.platform
     elif args.headless:
         os.environ["QT_QPA_PLATFORM"] = "offscreen"
+    if os.environ.get("QT_QPA_PLATFORM") == "offscreen" and not os.environ.get("QT_QPA_FONTDIR"):
+        # The offscreen platform ships no fonts: without this, screenshots of a headless window have no text.
+        fonts = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" if os.name == "nt" else Path("/usr/share/fonts")
+        if fonts.is_dir():
+            os.environ["QT_QPA_FONTDIR"] = str(fonts)
     if args.dev:
         os.environ["VM_HARNESS_DEV"] = "1"
 
@@ -178,26 +185,8 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # Ensure .pyd can be loaded from frozen EXE — add _internal to Python path
-    _executable_dir = os.path.dirname(os.path.abspath(sys.executable) if getattr(sys, 'frozen', False) else __file__)
-    for _extra_path in (os.path.join(_executable_dir, "_internal"), os.path.join(_executable_dir, "..", "_internal"), "_internal"):
-        if os.path.isdir(_extra_path) and _extra_path not in sys.path:
-            sys.path.insert(0, _extra_path)
-
-    # Enable High-DPI rendering — MUST be before QApplication creation
-    try:
-        from PyQt5.QtCore import QtApplicationAttribute
-        QtApplicationAttribute.AA_EnableHighDpiScaling
-        Qt.setAttribute(QtApplicationAttribute.AA_EnableHighDpiScaling, True)
-        Qt.setAttribute(QtApplicationAttribute.AA_UseHighDpiPixmaps, True)
-    except Exception:
-        # Fallback for older PyQt5: direct enum value
-        try:
-            from PyQt5.QtCore import Qt
-            Qt.setAttribute(Qt.ApplicationAttribute.AA_EnableHighDpiScaling, True)  # type: ignore
-            Qt.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps, True)  # type: ignore
-        except Exception:
-            pass
+    # Register atexit cleanup
+    atexit.register(_release_lock)
 
     # Run GUI
     logger.info("Starting VM-Harness GUI")
@@ -207,6 +196,8 @@ def main():
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
+    if os.environ.get("VMH_NO_HUB") != "1":
+        window.attach_hub()
     
     try:
         exit_code = app.exec_()

@@ -20,7 +20,7 @@ from PyQt5.QtWidgets import (
     QTextBrowser,
     QMessageBox,
     QFileDialog,
-    QSizePolicy,
+    QSizePolicy, QTextEdit,
 )
 
 from gui.widgets import Card, LogEntry, TextInput

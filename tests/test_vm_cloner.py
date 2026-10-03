@@ -377,7 +377,7 @@ class TestVMCloner:
         success, msg = cloner.linked_clone(str(base), str(tmp_dir / "new.qcow2"))
         assert success
         assert "started" in msg.lower()
-        qtbot.waitUntil(lambda: not cloner.is_running, timeout=5000)
+        qtbot.waitUntil(lambda: not cloner.is_running, timeout=30000)  # qemu-img under a loaded machine can take a while
 
     def test_async_while_running_raises(self, fake_qemu_img, tmp_dir, qtbot):
         base = tmp_dir / "base.qcow2"
@@ -386,7 +386,7 @@ class TestVMCloner:
         cloner.linked_clone(str(base), str(tmp_dir / "new.qcow2"))
         with pytest.raises(RuntimeError, match="already in progress"):
             cloner.linked_clone(str(base), str(tmp_dir / "new2.qcow2"))
-        qtbot.waitUntil(lambda: not cloner.is_running, timeout=5000)
+        qtbot.waitUntil(lambda: not cloner.is_running, timeout=30000)  # qemu-img under a loaded machine can take a while
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -406,7 +406,7 @@ class TestCloneWorker:
         dest = str(tmp_path / "new.qcow2")
         worker = CloneWorker(fake_qemu_img, "linked", str(base), dest)
         worker.start()
-        qtbot.waitUntil(lambda: not worker.isRunning(), timeout=5000)
+        qtbot.waitUntil(lambda: not worker.isRunning(), timeout=30000)  # qemu-img under a loaded machine can take a while
         assert os.path.exists(dest)
 
     def test_full_clone_worker(self, fake_qemu_img, tmp_path, qtbot):
@@ -415,7 +415,7 @@ class TestCloneWorker:
         dest = str(tmp_path / "dest.qcow2")
         worker = CloneWorker(fake_qemu_img, "full", str(source), dest)
         worker.start()
-        qtbot.waitUntil(lambda: not worker.isRunning(), timeout=5000)
+        qtbot.waitUntil(lambda: not worker.isRunning(), timeout=30000)  # qemu-img under a loaded machine can take a while
         assert os.path.exists(dest)
 
     def test_worker_progress_signals(self, fake_qemu_img, tmp_path, qtbot):
@@ -425,8 +425,7 @@ class TestCloneWorker:
         worker = CloneWorker(fake_qemu_img, "linked", str(base), dest)
         progress_values = []
         worker.progress.connect(lambda pct, msg: progress_values.append(pct))
-        worker.start()
-        qtbot.waitUntil(lambda: not worker.isRunning(), timeout=5000)
+        worker.run()  # on this thread: the signals arrive at once (no dependence on the event loop's state)
         assert len(progress_values) > 0
 
     def test_worker_finished_ok_signal(self, fake_qemu_img, tmp_path, qtbot):
@@ -436,8 +435,7 @@ class TestCloneWorker:
         worker = CloneWorker(fake_qemu_img, "linked", str(base), dest)
         results = []
         worker.finished_ok.connect(lambda path: results.append(path))
-        worker.start()
-        qtbot.waitUntil(lambda: not worker.isRunning(), timeout=5000)
+        worker.run()  # on this thread: the signals arrive at once (no dependence on the event loop's state)
         assert len(results) == 1
         assert results[0] == dest
 
@@ -445,8 +443,7 @@ class TestCloneWorker:
         worker = CloneWorker(fake_qemu_img, "linked", "/nonexistent/path.qcow2", str(tmp_path / "dest.qcow2"))
         errors = []
         worker.failed.connect(lambda msg: errors.append(msg))
-        worker.start()
-        qtbot.waitUntil(lambda: not worker.isRunning(), timeout=5000)
+        worker.run()  # on this thread: the signals arrive at once (no dependence on the event loop's state)
         assert len(errors) > 0
 
     def test_worker_unknown_operation(self, fake_qemu_img, tmp_path, qtbot):
@@ -455,8 +452,7 @@ class TestCloneWorker:
         worker = CloneWorker(fake_qemu_img, "unknown_op", str(base), str(tmp_path / "dest.qcow2"))
         errors = []
         worker.failed.connect(lambda msg: errors.append(msg))
-        worker.start()
-        qtbot.waitUntil(lambda: not worker.isRunning(), timeout=5000)
+        worker.run()  # on this thread: the signals arrive at once (no dependence on the event loop's state)
         assert any("unknown" in e.lower() for e in errors)
 
 

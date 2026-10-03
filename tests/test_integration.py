@@ -27,7 +27,7 @@ from gui.metrics_store import MetricsStore, MetricSample, AlertRule, TIER_RAW, T
 from gui.snapshot_scheduler import SnapshotScheduler, SnapshotSchedule, ScheduleType, SnapshotBackend
 from gui.multi_vm import MultiVMManager, VMConfig
 from gui.provider_store import ProviderStore, ProviderConfig, UsageRecord
-from gui.panels_usb import USBDevice, enumerate_usb_devices_wmi, _sample_devices, USBDevicePanel
+from gui.panels_usb import USBDevice, enumerate_usb_devices_wmi, USBDevicePanel
 from gui.panels_network import NetworkPanel
 from gui.panels_network_editor import NetworkConfigEditor, generate_mac, validate_mac
 from gui.panels_vm_switcher import VMSwitcherPanel
@@ -923,17 +923,6 @@ class TestVMCloning:
 
 class TestUSBDeviceEnumeration:
     """Tests for USB device enumeration and panel."""
-
-    def test_sample_devices(self):
-        """Get sample USB devices."""
-        devices = _sample_devices()
-        assert len(devices) == 4
-        
-        # Check known devices
-        vendor_ids = {d.vendor_id for d in devices}
-        assert "046d" in vendor_ids  # Logitech
-        assert "0781" in vendor_ids  # SanDisk
-        assert "05ac" in vendor_ids  # Apple
 
     def test_usb_device_to_dict(self):
         """USB device converts to dict."""

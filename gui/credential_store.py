@@ -210,7 +210,7 @@ class CredentialStore:
         entry = self._credentials[cid]
         try:
             decrypted = self._fernet.decrypt(entry["value"].encode()).decode()
-        except cryptography.fernet.Fernet.InvalidToken:
+        except InvalidToken:
             decrypted = "[decryption failed]"
         return Credential(
             cid=cid,

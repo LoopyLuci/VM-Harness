@@ -14,6 +14,7 @@ Example:
 from __future__ import annotations
 
 import asyncio
+import collections
 import json
 import logging
 from typing import Any
@@ -48,6 +49,10 @@ class QMPClient:
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._connected = False
+        # One command at a time on the socket: QMP answers in order, so two callers must not interleave.
+        self._lock = asyncio.Lock()
+        # Asynchronous events (STOP, RESUME, SHUTDOWN, ...) that arrived while waiting for an answer, newest last.
+        self.events: "collections.deque[dict[str, Any]]" = collections.deque(maxlen=500)
 
     async def connect(self) -> None:
         """Connect to QMP and complete the handshake.
@@ -117,21 +122,29 @@ class QMPClient:
 
         payload = json.dumps(message) + "\n"
         assert self._writer is not None
-        self._writer.write(payload.encode())
-        await self._writer.drain()
-
-        return await self._read_response()
+        async with self._lock:
+            try:
+                self._writer.write(payload.encode())
+                await self._writer.drain()
+                return await self._read_response()
+            except (ConnectionError, asyncio.IncompleteReadError, OSError):
+                self._connected = False
+                raise
 
     async def _read_response(self) -> dict[str, Any]:
-        """Read one JSON response line from QMP."""
+        """Read the answer to the command just sent, setting aside any events QEMU sends first."""
         assert self._reader is not None
-        data = await asyncio.wait_for(
-            self._reader.readuntil(b"\n"),
-            timeout=self._timeout,
-        )
-        if not data:
-            raise RuntimeError("QMP connection closed while reading response")
-        response = json.loads(data.decode())
+        while True:
+            data = await asyncio.wait_for(
+                self._reader.readuntil(b"\n"),
+                timeout=self._timeout,
+            )
+            if not data:
+                raise RuntimeError("QMP connection closed while reading response")
+            response = json.loads(data.decode())
+            if "event" not in response:
+                break
+            self.events.append(response)
         if "error" in response:
             raise RuntimeError(
                 f"QMP error: {response['error'].get('desc', 'unknown error')}"

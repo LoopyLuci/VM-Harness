@@ -75,7 +75,9 @@ def reset_module_state(request):
     This prevents test-ordering sensitivity where one test's mutations to
     module-level singletons leak into another test in a different file.
     """
-    # Nothing to do at setup — the teardown handles reset
+    # Remember the windows that exist before the test: those belong to longer-lived (class/module) fixtures and
+    # must survive; only what this test opened is closed afterwards.
+    before = _top_level_ids()
     yield
     # ── Teardown: reload modules that carry mutable global state ──────────────
     # We reload after each test function so the next test starts with a
@@ -90,8 +92,49 @@ def reset_module_state(request):
                 # already-garbage-collected Qt objects; that's fine.
                 pass
 
+    # Close what the test left open. Top-level windows and matplotlib canvases otherwise live on, and pytest-qt's event
+    # processing after every later test redraws all of them: a serial run grew slower with every GUI test until one
+    # timed out inside matplotlib's draw loop.
+    _close_leftover_widgets(before)
+
     # Force garbage collection to clean up any detached Qt objects
     gc.collect()
+
+
+def _top_level_ids() -> set[int]:
+    qtw = sys.modules.get("PyQt5.QtWidgets")
+    app = qtw.QApplication.instance() if qtw else None
+    if app is None:
+        return set()
+    return {id(w) for w in app.topLevelWidgets()}
+
+
+def _close_leftover_widgets(keep: set[int]) -> None:
+    mpl = sys.modules.get("matplotlib.pyplot")
+    if mpl is not None:
+        try:
+            mpl.close("all")
+        except Exception:  # noqa: BLE001 - best-effort cleanup
+            pass
+    qtw = sys.modules.get("PyQt5.QtWidgets")
+    if qtw is None:
+        return
+    app = qtw.QApplication.instance()
+    if app is None:
+        return
+    from PyQt5.QtCore import QTimer
+    for w in app.topLevelWidgets():
+        if id(w) in keep:
+            continue
+        # Close it and stop its timers, but do not delete it: some top-level widgets (menus, dialogs) are owned by
+        # longer-lived windows, and deleting them under their owner crashes Qt. A closed widget with no running timer
+        # costs nothing in later tests.
+        try:
+            for t in w.findChildren(QTimer):
+                t.stop()
+            w.close()
+        except RuntimeError:  # already deleted on the C++ side
+            pass
 
 
 @pytest.fixture(scope="session", autouse=True)

@@ -378,10 +378,10 @@ class TestTopologyDiagram:
         diagram = TopologyDiagram()
         diagram.resize(400, 200)
         diagram.show()
-        # Force a repaint
-        diagram.update()
-        # If we get here without exception, paint works
-        assert diagram._scene is not None
+        # Render it for real: grab() runs paintEvent into a pixmap.
+        diagram.set_port_forwards([{"host_port": 2222, "guest_port": 22, "protocol": "tcp"}])
+        pix = diagram.grab()
+        assert not pix.isNull() and pix.width() == 400
 
 
 # ── Test Category 8: Port Forward Dialog ────────────────────────────────────
