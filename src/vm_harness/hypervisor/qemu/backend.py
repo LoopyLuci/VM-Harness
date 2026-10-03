@@ -77,6 +77,24 @@ def find_qemu(tool: str) -> str | None:
     return _proc.find_tool([tool], [Path(os.path.expandvars(d)) / exe for d in dirs if d])
 
 
+def _preferred_accelerator() -> str:
+    """The best accelerator this host can actually use, or '' for none.
+
+    Falls back to the OS-name heuristic if probing is unavailable, so a
+    stripped environment still gets a sensible answer rather than no accel.
+    """
+    try:
+        from vm_harness import env
+
+        accelerators = env.supported_accelerators()
+    except Exception:
+        accelerators = []
+    for accel in accelerators:
+        if accel != "tcg":
+            return accel
+    return ""
+
+
 def _firmware(name: str, qemu_binary: str) -> str | None:
     """An EDK2 firmware file shipped with QEMU (next to the binary, or in share/)."""
     base = Path(qemu_binary).resolve().parent
@@ -1047,14 +1065,16 @@ class QEMUBackend(HypervisorBackend):
         args.extend(["-name", name])
         args.extend(["-qmp", f"tcp:127.0.0.1:{qmp_port},server,nowait"])
 
-        # Acceleration: the hardware accelerator if it works, else QEMU falls back to TCG (slower, always there).
+        # Acceleration: the hardware accelerator if the host really has it, else TCG (slower, always present).
+        # Chosen from a live probe of the QEMU binary and the host, not from the OS name: WHPX without the
+        # Windows hypervisor makes QEMU fail to start instead of falling back. WHPX also needs
+        # kernel-irqchip=off on this class of host. TCG stays in the list as the guaranteed fallback.
         if config.get("enable_kvm", True):
-            if os.name == "nt":
+            accel = _preferred_accelerator()
+            if accel == "whpx":
                 args.extend(["-accel", "whpx,kernel-irqchip=off"])
-            elif sys.platform == "darwin":
-                args.extend(["-accel", "hvf"])
-            else:
-                args.extend(["-accel", "kvm"])
+            elif accel:
+                args.extend(["-accel", accel])
         args.extend(["-accel", "tcg"])
 
         # Firmware. UEFI gets its code (read-only) and a variable store of its own in the VM's folder, so boot
