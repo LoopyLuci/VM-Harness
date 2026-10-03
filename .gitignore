@@ -101,6 +101,8 @@ ci/artifacts/desktop/*.sha256
 
 # Build output and runtime state (never commit)
 target/
+.vmharness_state/
+.vmharness_backup/
 
 # Node dependencies (restore with `npm ci` in web/)
 web/node_modules/
