@@ -67,6 +67,56 @@ DEFAULT_SPICE_PORT_BASE = 5930
 DEFAULT_VNC_PORT_BASE = 5900
 DEFAULT_VMS_DIR = str(Path.home() / ".qemu-mcp" / "vms")
 
+#: QEMU ``id=`` of the USB tablet, the device remote pointer events are addressed to
+#: (``QMP input-send-event`` with ``device: "tablet0"``). Must stay stable: the streaming
+#: bridge pins it via ``VMHARNESS_BRIDGE_TABLET_DEVICE``.
+TABLET_DEVICE_ID = "tablet0"
+#: QEMU ``id=`` of the explicit keyboard, so keystrokes have a documented target instead
+#: of QEMU's implicit, machine-created PS/2 keyboard.
+KEYBOARD_DEVICE_ID = "kbd0"
+TABLET_MODEL = "usb-tablet"
+KEYBOARD_MODEL = "virtio-keyboard"
+
+
+def _extra_args_declare_device(extra_args: list[Any], model: str) -> bool:
+    """True when the user already passes this device by hand through ``extra_args``.
+
+    Both ``-device usb-tablet`` and ``-device=usb-tablet`` are recognised so a
+    hand-written escape hatch is never duplicated by the generated flags.
+    """
+    for i, arg in enumerate(extra_args):
+        text = str(arg)
+        if text.startswith("-device=") and text.split("=", 1)[1].split(",", 1)[0].strip() == model:
+            return True
+        if text == "-device":
+            value = str(extra_args[i + 1]) if i + 1 < len(extra_args) else ""
+            if value.split(",", 1)[0].strip() == model:
+                return True
+    return False
+
+
+def input_device_args(config: dict[str, Any]) -> list[str]:
+    """The input devices a VM is launched with: a USB tablet and an explicit keyboard.
+
+    QMP ``input-send-event`` with ``type: "abs"`` is only meaningful for a device that
+    declares absolute axes. Without a tablet QEMU falls back to a relative PS/2 mouse,
+    drops the absolute events without reporting an error, and the remote pointer simply
+    never moves -- the keyboard works only through QEMU's implicit PS/2 keyboard.
+
+    Both are configurable (``usb_tablet`` / ``virtio_keyboard``, default on) because a few
+    guests and drivers prefer no tablet, and both are skipped when ``extra_args`` already
+    declares them.
+    """
+    extra_args = config.get("extra_args") or []
+    args: list[str] = []
+    if config.get("usb_tablet", True) and not _extra_args_declare_device(extra_args, TABLET_MODEL):
+        # "-usb" first: q35 and pc ship no USB controller on their PCI bus, and QEMU refuses
+        # to start with "No 'usb-bus' bus found for device 'usb-tablet'" without one.
+        args.extend(["-usb", "-device", f"{TABLET_MODEL},id={TABLET_DEVICE_ID}"])
+    if config.get("virtio_keyboard", True) and not _extra_args_declare_device(extra_args, KEYBOARD_MODEL):
+        args.extend(["-device", f"{KEYBOARD_MODEL},id={KEYBOARD_DEVICE_ID}"])
+    return args
+
 
 def find_qemu(tool: str) -> str | None:
     """A QEMU program: $VMH_QEMU_DIR, PATH, then the usual install places (installer, Scoop, Chocolatey, MSYS2)."""
@@ -1157,6 +1207,10 @@ class QEMUBackend(HypervisorBackend):
             args.extend(["-display", "sdl"])
         elif display_type == "gtk":
             args.extend(["-display", "gtk"])
+
+        # Input devices: an absolute pointing device (QMP abs events need one) and an
+        # explicit keyboard. Without the tablet the remote pointer never moves.
+        args.extend(input_device_args(config))
 
         # ISO
         if iso_path and os.path.exists(iso_path):

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 # Suppress CLI console windows on Windows
 CREATE_NO_WINDOW = 0x08000000
@@ -52,12 +53,17 @@ class TestTerminalWebSocket(unittest.TestCase):
     CONTAINER_NAME = "test-terminal-e2e"
     BRIDGE_HOST = "127.0.0.1"
     BRIDGE_PORT = 8445
+    # The bridge refuses unauthenticated clients, so the test pins the token it
+    # starts the bridge with and sends the same one. Without this the socket is
+    # closed before the command is ever read.
+    TOKEN = "test-terminal-e2e-token"
 
     # ── Bridge server lifecycle ────────────────────────────────────────────
 
     @classmethod
     def setUpClass(cls):
         """Start the streaming bridge server in a background thread."""
+        os.environ["VMHARNESS_BRIDGE_TOKEN"] = cls.TOKEN
         cls._loop = asyncio.new_event_loop()
         cls._bridge = StreamingBridge()
 
@@ -151,6 +157,11 @@ class TestTerminalWebSocket(unittest.TestCase):
             session = aiohttp.ClientSession()
             try:
                 async with session.ws_connect(ws_url) as ws:
+                    # The bridge requires auth as the first message. There is no
+                    # unauthenticated path by design: an open docker exec beside
+                    # an authenticated frame stream would make the frame
+                    # stream's auth decorative.
+                    await ws.send_str(json.dumps({"type": "auth", "key": self.TOKEN}))
                     await ws.send_str(json.dumps({"command": "echo hello"}))
                     while time.time() < deadline:
                         try:

@@ -33,6 +33,46 @@ DEFAULT_QMP_PORT_BASE = 4444
 DEFAULT_SSH_PORT_BASE = 2222
 DEFAULT_DISK_FORMAT = "qcow2"
 
+# ── Input devices ─────────────────────────────────────────────────────────────
+# A USB tablet is an absolute pointing device: QMP "input-send-event" with type "abs" is
+# silently dropped without one (a PS/2 mouse declares relative axes), so remote mouse
+# control never moves the pointer. The ids must stay stable -- the streaming bridge pins
+# the tablet's device field (VMHARNESS_BRIDGE_TABLET_DEVICE) when sending input events.
+TABLET_DEVICE_ID = "tablet0"
+KEYBOARD_DEVICE_ID = "kbd0"
+TABLET_MODEL = "usb-tablet"
+KEYBOARD_MODEL = "virtio-keyboard"
+
+
+def _extra_args_declare_device(extra_args: list[Any], model: str) -> bool:
+    """True when the user already passes this device by hand through ``extra_args``.
+
+    Both ``-device usb-tablet`` and ``-device=usb-tablet`` are recognised so a
+    hand-written escape hatch is never duplicated by the generated flags.
+    """
+    for i, arg in enumerate(extra_args):
+        text = str(arg)
+        if text.startswith("-device=") and text.split("=", 1)[1].split(",", 1)[0].strip() == model:
+            return True
+        if text == "-device":
+            value = str(extra_args[i + 1]) if i + 1 < len(extra_args) else ""
+            if value.split(",", 1)[0].strip() == model:
+                return True
+    return False
+
+
+def input_device_args(config: "VMConfig") -> list[str]:
+    """The input devices a VM is launched with, honouring the config switches and extra_args."""
+    args: list[str] = []
+    extra_args = config.extra_args or []
+    if config.usb_tablet and not _extra_args_declare_device(extra_args, TABLET_MODEL):
+        # "-usb" first: q35 ships no USB controller on its PCI bus, and QEMU refuses to
+        # start with "No 'usb-bus' bus found for device 'usb-tablet'" without one.
+        args.extend(["-usb", "-device", f"{TABLET_MODEL},id={TABLET_DEVICE_ID}"])
+    if config.virtio_keyboard and not _extra_args_declare_device(extra_args, KEYBOARD_MODEL):
+        args.extend(["-device", f"{KEYBOARD_MODEL},id={KEYBOARD_DEVICE_ID}"])
+    return args
+
 # Global resource limits — apply across ALL VMs
 GLOBAL_MAX_RAM_MB = 65536      # 64 GB total across all VMs
 GLOBAL_MAX_CPUS = 32           # 32 vCPUs total
@@ -134,6 +174,12 @@ class VMConfig:
         self.enable_gl: bool = cfg.get("enable_gl", True)
         self.vga: str = cfg.get("vga", "virtio")
 
+        # Input devices. The tablet is an absolute pointing device: QMP input-send-event
+        # with type "abs" is dropped without one, so remote mouse control silently fails.
+        # Both are on by default and can be turned off for guests/drivers that object.
+        self.usb_tablet: bool = bool(cfg.get("usb_tablet", True))
+        self.virtio_keyboard: bool = bool(cfg.get("virtio_keyboard", True))
+
         # Boot options
         self.boot_order: str = cfg.get("boot_order", "cd")  # c=hd, d=cdrom, n=network
         self.auto_eject_iso: bool = cfg.get("auto_eject_iso", True)
@@ -183,6 +229,8 @@ class VMConfig:
             "display": self.display,
             "enable_gl": self.enable_gl,
             "vga": self.vga,
+            "usb_tablet": self.usb_tablet,
+            "virtio_keyboard": self.virtio_keyboard,
             "boot_order": self.boot_order,
             "auto_eject_iso": self.auto_eject_iso,
             "status": self.status,
@@ -658,10 +706,17 @@ class MultiVMManager:
             "-name", config.vm_name,
         ]
 
+        # Input devices: an absolute pointing device (QMP abs events need one) and an
+        # explicit keyboard instead of QEMU's implicit PS/2 one.
+        args.extend(input_device_args(config))
+
         # Display backend
         if config.display == "spice":
-            args.extend(["-display", "spice"])
+            # QEMU removed "-display spice"; it now fails with
+            # "Parameter 'type' does not accept value 'spice'". The server is configured
+            # with -spice and guest output is left headless for a client to attach to.
             spice_port = getattr(config, 'spice_port', 0)
+            args.extend(["-display", "none"])
             if spice_port:
                 args.extend(["-spice", f"port={spice_port},disable-ticketing,streaming-video=all"])
             else:

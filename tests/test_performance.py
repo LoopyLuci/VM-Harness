@@ -43,13 +43,26 @@ class TestPanelPerformance(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        cls._owns_app = QApplication.instance() is None
         cls.app = QApplication.instance() or QApplication(sys.argv)
         cls.app.setQuitOnLastWindowClosed(False)
 
     @classmethod
     def tearDownClass(cls):
-        """Quit the QApplication to prevent hangs from lingering timers."""
-        cls.app.quit()
+        """Only quit a QApplication this class created.
+
+        This used to call quit() unconditionally. Under pytest the QApplication
+        is shared across the whole session, and quitting it breaks every GUI
+        test that runs afterwards: newly created widgets stop getting valid
+        geometry, so mapFromScene and layout return nonsense. That is why 27
+        console-panel tests passed on their own and failed in the full suite.
+
+        It was also not doing what the docstring claimed. quit() only affects a
+        running event loop, and there is none here; the actual protection against
+        lingering timers is closing the windows, which _cleanup_window does.
+        """
+        if cls._owns_app:
+            cls.app.quit()
 
     def test_panel_switching_performance(self):
         """Main performance test: cycle through all panels, measure time & memory."""

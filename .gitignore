@@ -114,3 +114,7 @@ web/node_modules/
 ci/logs/
 ci/reports/
 ci/.pipeline.lock
+
+# Local GUI settings, written by panels_settings and panels_vm_console on import.
+# Machine-specific (bridge URL, token path, fps/quality), so it must not be shared.
+gui/settings.json

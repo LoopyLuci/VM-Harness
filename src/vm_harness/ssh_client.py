@@ -44,6 +44,18 @@ async def _connect(secrets: Secrets, settings: VmMCPSettings) -> asyncssh.SSHCli
 
     kwargs = settings.ssh_connect_kwargs(secrets)
 
+    # ``known_hosts`` comes from settings and defaults to ``None``, which for
+    # asyncssh means "do not verify the host key". That is deliberate for the
+    # same reason as in ``vm_harness.pty``: the guest is a throwaway local VM
+    # behind a QEMU NAT forward whose key changes on every reinstall. An
+    # interactive terminal that refuses to open after a rebuild is useless
+    # precisely when it is needed. Set ``ssh_known_hosts`` to pin it if a
+    # deployment wants the strict behaviour back.
+    if settings.ssh_known_hosts:
+        kwargs["known_hosts"] = settings.ssh_known_hosts
+    else:
+        kwargs["known_hosts"] = None
+
     # Log attempt without exposing credentials
     ssh_desc = "key" if secrets.get_ssh_private_key() else "password"
     logger.info("Connecting to SSH %s on %s:%d (%s auth)", ssh_desc, settings.ssh_host, settings.ssh_port, settings.ssh_username)
@@ -70,6 +82,52 @@ async def _close() -> None:
         except Exception:
             pass
         _connection = None
+
+
+async def disconnect() -> None:
+    """Close the cached connection. Public alias for :func:`_close`.
+
+    Exists because the GUI disconnect path called a name that did not exist:
+    ``SSHBridge._disconnect_impl`` raised ``AttributeError`` on every Disconnect
+    click, the generic handler turned it into an error signal, and the socket
+    stayed open. A disconnect that cannot disconnect is worse than none.
+    """
+    await _close()
+
+
+def settings_for_vm(
+    base: VmMCPSettings,
+    *,
+    vm_name: str | None = None,
+    ssh_host: str | None = None,
+    ssh_port: int | None = None,
+    ssh_username: str | None = None,
+) -> VmMCPSettings:
+    """A copy of ``base`` aimed at one specific VM.
+
+    ``SSHBridge`` used to hold exactly one ``VmMCPSettings`` for the whole
+    application, so with several VMs running every command went to whichever one
+    the settings file happened to describe. Each VM in ``MultiVMManager`` has its
+    own forwarded SSH port and user, so the target has to travel with the
+    operation rather than being global state.
+    """
+    updates: dict[str, Any] = {}
+    if vm_name:
+        updates["vm_name"] = vm_name
+    if ssh_host:
+        updates["ssh_host"] = ssh_host
+    if ssh_port:
+        updates["ssh_port"] = int(ssh_port)
+    if ssh_username:
+        updates["ssh_username"] = ssh_username
+    if not updates:
+        return base
+    try:
+        return base.model_copy(update=updates)
+    except AttributeError:  # pragma: no cover - a non-pydantic settings object
+        for key, value in updates.items():
+            setattr(base, key, value)
+        return base
 
 
 # ── Public helpers ──────────────────────────────────────────────────────────────

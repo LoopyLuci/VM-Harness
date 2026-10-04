@@ -21,3 +21,8 @@ aioquic>=0.9.0
 zeroconf>=0.130.0
 tailscale>=0.1.0
 pycdlib>=1.14.0
+# Pillow decodes the PNG from QEMU's `screendump` and re-encodes it as JPEG for
+# streaming_bridge.py. The PyPI name is Pillow, the import name is PIL.
+Pillow>=10.0.0
+# Blocking WebSocket client for the container-terminal and VM-console panels.
+websocket-client>=1.7.0

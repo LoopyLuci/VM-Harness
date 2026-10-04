@@ -29,6 +29,15 @@ dependencies = [
     # Portable, needs no privileges, and emits Joliet + Rock Ridge so long
     # filenames survive.
     "pycdlib>=1.14.0",
+    # Decodes the PNG QEMU's `screendump` produces and re-encodes it as JPEG for
+    # the streaming bridge (streaming_bridge.py). Pillow, not "PIL": the package
+    # name on PyPI and the import name differ, and getting it wrong is a pip
+    # error that only shows up at runtime on a machine without it installed.
+    "Pillow>=10.0.0",
+    # Blocking WebSocket *client*, used by the container-terminal and VM-console
+    # panels (gui/panels_container_terminal.py, gui/panels_vm_console.py) to
+    # reach the local bridges. Not aiohttp: those panels run on the Qt thread.
+    "websocket-client>=1.7.0",
 ]
 
 [project.optional-dependencies]

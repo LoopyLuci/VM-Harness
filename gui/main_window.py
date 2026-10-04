@@ -581,10 +581,31 @@ class MainWindow(QMainWindow):
         self.hub_link.start()
         return self.hub_link
 
+    def shutdown(self) -> None:
+        """Stop every background thread this window started.
+
+        QMPBridge and SSHBridge each own a thread running an asyncio loop, and
+        neither closeEvent nor _quit_from_tray stopped them. Closing the window
+        therefore left both threads alive for the lifetime of the process,
+        still posting Qt signals at a window that no longer exists. In the GUI
+        that is a leak; under pytest it is worse than a leak, because the
+        orphaned loops starve the event queue and every later GUI test times
+        out waiting for a timer.
+        """
+        for name in ("qmp_bridge", "ssh_bridge"):
+            bridge = getattr(self, name, None)
+            if bridge is None:
+                continue
+            try:
+                bridge.stop()
+            except Exception:  # noqa: BLE001 - shutdown must not raise
+                pass
+
     def _quit_from_tray(self):
         """Quit from tray — properly clean up."""
         if getattr(self, "hub_link", None) is not None:
             self.hub_link.stop()
+        self.shutdown()
         self._save_state()
         if self.tray_icon:
             self.tray_icon.hide()
@@ -600,6 +621,9 @@ class MainWindow(QMainWindow):
         self._save_state()
         if hasattr(self, 'plugin_manager'):
             self.plugin_manager.unload_all()
+        # Stop the bridge threads before deciding to hide. A hidden window with
+        # live QMP/SSH loops is exactly the leak shutdown() exists to prevent.
+        self.shutdown()
         if hasattr(self, '_grips'):
             for grip in self._grips:
                 grip.releaseMouse()
