@@ -147,6 +147,10 @@ MIN_QUALITY = 1
 MAX_QUALITY = 100
 DEFAULT_FPS = 30
 MIN_FPS = 1
+#: Smallest remainder worth waiting out. Below this a subscriber is effectively
+#: due, so it blocks on the frame queue instead of spinning on a timer that
+#: cannot win the race against a screendump.
+_MIN_PACING_WAIT_SEC = 0.005
 #: A screendump is a socket round trip plus a PNG decode plus a JPEG encode.
 #: Asking for more than this cannot make frames arrive faster, only make the
 #: server busy; 60 matches the Rust sidecar on 8446 so both honour one config.
@@ -867,11 +871,38 @@ class FrameSubscriber:
 
     async def run(self) -> None:
         while True:
-            timeout: Optional[float] = None
+            # How long until this client is allowed its next frame.
+            #
+            # When that time has already passed the next frame is due *now*, so
+            # block until one exists rather than waiting out a remainder of
+            # zero. Passing timeout=0 to wait_for is the trap: it raises
+            # TimeoutError before the inner queue.get() ever gets to run, and
+            # because _last_send only advances on a successful send, every
+            # later iteration recomputes the same zero. The result is a busy
+            # loop that spins hundreds of thousands of times a second and never
+            # delivers another frame -- measured at 189k timeouts in 6s, with
+            # the client stuck on frame 1. Clamping the remainder to zero and
+            # treating it as "wait for zero" is what made a high requested fps
+            # deliver exactly one frame.
+            wait_for: Optional[float] = None
             if self._last_send is not None:
-                timeout = max(0.0, self.interval - (time.monotonic() - self._last_send))
+                wait_for = self.interval - (time.monotonic() - self._last_send)
+                # Due now, or so close that timing out would just churn: a
+                # requested fps above what the capture can actually deliver
+                # otherwise spends thousands of iterations per second timing out
+                # on sub-millisecond remainders while waiting for a screendump
+                # that takes tens of milliseconds.
+                if wait_for <= _MIN_PACING_WAIT_SEC:
+                    wait_for = None  # due now: block on the queue instead
             try:
-                kind, payload = await asyncio.wait_for(self.queue.get(), timeout=timeout)
+                if wait_for is None:
+                    kind, payload = await self.queue.get()
+                else:
+                    kind, payload = await asyncio.wait_for(
+                        self.queue.get(), timeout=wait_for
+                    )
+            except asyncio.CancelledError:
+                raise
             except asyncio.TimeoutError:
                 continue
             if kind == "error":

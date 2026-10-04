@@ -964,3 +964,140 @@ def test_docker_exec_suppresses_console_windows(monkeypatch: pytest.MonkeyPatch)
     assert captured["kwargs"]["creationflags"] == sb.CREATE_NO_WINDOW
     assert captured["cmd"][:2] == ["docker", "exec"]
     assert "-i" in captured["cmd"], "an interactive shell needs stdin kept open"
+
+
+class _StubTarget:
+    name = "stub-vm"
+
+
+class _StubEncoder:
+    def encode(self, image, quality, width, height):
+        return b"\xff\xd8\xff" + bytes([quality & 0xFF])
+
+
+class _StubSource:
+    """A source that publishes frames on demand, with no QEMU involved.
+
+    Pushing frames in from the test is the point: the defect was in the
+    subscriber's pacing arithmetic, so the capture side has to be perfect for
+    the bug to show.
+    """
+
+    def __init__(self):
+        self.target = _StubTarget()
+        self.encoder = _StubEncoder()
+        self.queue = asyncio.Queue(maxsize=1)
+        self.published = 0
+
+    def new_queue(self):
+        return self.queue
+
+    def resubscribe(self, queue, fps):
+        pass
+
+    def unsubscribe(self, queue):
+        pass
+
+    async def publish(self, n):
+        for _ in range(n):
+            self.published += 1
+            if self.queue.full():
+                with contextlib.suppress(asyncio.QueueEmpty):
+                    self.queue.get_nowait()
+            self.queue.put_nowait(("frame", sb.Frame(image=object(), seq=self.published, captured_at=0.0)))
+
+
+async def _drain(subscriber: "sb.FrameSubscriber", seconds: float) -> list:
+    sent: list = []
+
+    async def send(data):
+        sent.append(data)
+
+    async def on_error(message):
+        pass
+
+    source = _StubSource()
+    subscriber = sb.FrameSubscriber(source, send, on_error, fps=30, quality=80, width=64, height=64)
+    subscriber.start()
+    try:
+        # Publish far more frames than the subscriber can send, at a rate that
+        # keeps a frame available.
+        for _ in range(12):
+            await source.publish(20)
+            await asyncio.sleep(0.05)
+        await asyncio.sleep(seconds)
+    finally:
+        await subscriber.stop()
+    return sent
+
+
+@pytest.mark.parametrize("fps", [10, 30, 60])
+async def test_subscriber_keeps_delivering_at_high_fps(fps):
+    """A high requested fps must not reduce delivery to a single frame.
+
+    The subscriber computed its wait as ``interval - since_last_send`` and
+    clamped the remainder to zero. Once that remainder reached zero,
+    ``wait_for(queue.get(), 0)`` raised TimeoutError before the getter could
+    run, and because the send timestamp only advances on a successful send,
+    every later iteration recomputed zero: a busy loop that delivered frame 1
+    and then nothing. Measured at 189k spurious timeouts in 6 seconds.
+    """
+    sent: list = []
+
+    async def send(data):
+        sent.append(data)
+
+    async def on_error(message):
+        pass
+
+    source = _StubSource()
+    subscriber = sb.FrameSubscriber(source, send, on_error, fps=fps, quality=80, width=64, height=64)
+    subscriber.start()
+    try:
+        for _ in range(10):
+            await source.publish(15)
+            await asyncio.sleep(0.05)
+    finally:
+        await subscriber.stop()
+
+    assert len(sent) >= 5, (
+        f"fps={fps}: only {len(sent)} frame(s) delivered; the pacing wait "
+        "collapsed to zero and stopped the subscriber"
+    )
+
+
+async def test_subscriber_does_not_busy_spin():
+    """The wait must never be issued with a zero timeout.
+
+    A zero timeout aborts the queue getter before it runs, and because it never
+    succeeds the timestamp never advances -- so zero is not a transient, it is
+    permanent.
+    """
+    seen: list = []
+
+    real_wait_for = asyncio.wait_for
+
+    async def spy(aw, timeout=None, **kwargs):
+        if timeout is not None and timeout <= 0:
+            seen.append(timeout)
+        return await real_wait_for(aw, timeout, **kwargs)
+
+    async def send(data):
+        pass
+
+    async def on_error(message):
+        pass
+
+    source = _StubSource()
+    subscriber = sb.FrameSubscriber(source, send, on_error, fps=60, quality=80, width=64, height=64)
+    subscriber.start()
+    asyncio.wait_for = spy
+    try:
+        for _ in range(8):
+            await source.publish(15)
+            await asyncio.sleep(0.04)
+    finally:
+        asyncio.wait_for = real_wait_for
+        await subscriber.stop()
+
+    assert seen == [], f"subscriber issued {len(seen)} waits with timeout<=0"

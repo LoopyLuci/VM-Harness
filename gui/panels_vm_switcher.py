@@ -273,7 +273,17 @@ class VMSwitcherPanel(QWidget):
         self._manager.poll_status()
         self._manager.cleanup_exited()
 
+        # clear() destroys the current item, so the selection must be carried
+        # across the rebuild or every action button silently dies. refresh()
+        # runs on a 5s timer, which made this look like the buttons were
+        # intermittently broken: select a VM, wait a moment, and Switch To,
+        # Start or Remove would all claim no VM was selected. The details pane
+        # went with it, because clear() also fires currentItemChanged(None).
+        previously_selected = self._get_selected_name()
+
+        self._vm_list.blockSignals(True)
         self._vm_list.clear()
+        restore_to: QListWidgetItem | None = None
         for vm_name in self._manager.list_vms():
             config = self._manager.get_vm(vm_name)
             item = QListWidgetItem(vm_name)
@@ -290,9 +300,24 @@ class VMSwitcherPanel(QWidget):
             item.setData(Qt.UserRole, vm_name)
             self._vm_list.addItem(item)
 
+            if vm_name == previously_selected:
+                restore_to = item
+
             # Reselect active VM
             if self._active_vm == vm_name:
                 self._vm_list.setCurrentItem(item)
+
+        # Restore the user's selection, then let the normal handler repopulate
+        # the details. Signals were blocked so the intermediate empty state did
+        # not blank the pane.
+        self._vm_list.blockSignals(False)
+        if restore_to is not None:
+            self._vm_list.setCurrentItem(restore_to)
+        else:
+            # Nothing to restore: either nothing was selected, or the selected
+            # VM no longer exists. Either way the details must not keep showing
+            # a VM that is not in the list.
+            self._clear_details()
 
     def _get_selected_name(self) -> str | None:
         """Get the actual VM name of the currently selected item."""
