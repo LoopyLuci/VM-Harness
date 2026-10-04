@@ -213,6 +213,25 @@ class VMConsolePanel(QWidget):
     vm_list_changed = pyqtSignal(list)
     status_message = pyqtSignal(str)
 
+    # Hop from the WebSocket thread to the Qt thread.
+    #
+    # websocket-client delivers callbacks on its own daemon thread, and
+    # QTimer.singleShot schedules on the *calling* thread's event loop. A plain
+    # Python thread has no Qt event loop, so every singleShot issued from
+    # on_message silently never fires. That is not a cosmetic problem: auth_ok
+    # was parsed and thrown away, so _authenticated stayed False, config and
+    # subscribe were never sent, and the panel sat on "authenticating" with no
+    # error and no frames -- against both the Python bridge and the Continuum
+    # sidecar, and while every test that called these handlers directly from
+    # the Qt thread passed.
+    #
+    # Emitting a signal from a non-Qt thread to a QObject that lives in the Qt
+    # thread is queued automatically, so the slot runs where it belongs.
+    _frame_from_socket = pyqtSignal(bytes)
+    _control_from_socket = pyqtSignal(str)
+    _socket_error = pyqtSignal(str)
+    _socket_closed = pyqtSignal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
 
@@ -528,6 +547,13 @@ class VMConsolePanel(QWidget):
         )
         self._error_label.setWordWrap(True)
         card.content_layout.addWidget(self._error_label)
+
+        # Socket thread -> Qt thread. See the signal declarations for why this
+        # hop is required rather than convenient.
+        self._frame_from_socket.connect(self._handle_frame)
+        self._control_from_socket.connect(self._handle_control_message)
+        self._socket_error.connect(self._handle_ws_error)
+        self._socket_closed.connect(self._handle_disconnected)
 
     def _build_status_row(self) -> QWidget:
         row = QWidget()
@@ -1033,16 +1059,17 @@ class VMConsolePanel(QWidget):
         QTimer.singleShot(0, self._handle_connected)
 
     def _on_ws_message(self, ws, message) -> None:
+        # Emit, do not handle: this runs on the WebSocket thread.
         if isinstance(message, (bytes, bytearray)):
-            self._handle_frame(bytes(message))
+            self._frame_from_socket.emit(bytes(message))
         else:
-            self._handle_control_message(message)
+            self._control_from_socket.emit(str(message))
 
     def _on_ws_error(self, ws, error) -> None:
-        QTimer.singleShot(0, lambda: self._handle_ws_error(str(error)))
+        self._socket_error.emit(str(error))
 
     def _on_ws_close(self, ws, close_status_code=None, close_msg=None) -> None:
-        QTimer.singleShot(0, self._handle_disconnected)
+        self._socket_closed.emit()
 
     # ── Frame rendering (QImage off-thread, QPixmap on-thread) ───────────────
 

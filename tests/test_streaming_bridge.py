@@ -664,9 +664,47 @@ async def test_mouse_move_sends_one_abs_event_pair(harness: Harness):
     calls = harness.qmp("vm-a").of("input-send-event")
     assert len(calls) == 1, "both axes travel in one command, not two round trips"
     assert calls[0]["events"] == [
-        {"type": "abs", "data": {"axis": "x", "value": sb.to_axis(400, 800)}},
-        {"type": "abs", "data": {"axis": "y", "value": sb.to_axis(300, 600)}},
+        {"type": "abs", "data": {"axis": "x", "value": round(sb.to_axis(400, 800))}},
+        {"type": "abs", "data": {"axis": "y", "value": round(sb.to_axis(300, 600))}},
     ]
+
+
+async def test_abs_axis_values_are_integers(harness: Harness):
+    """QEMU rejects a float in events[].data.value: "Invalid parameter type for
+    'events[0].data.value', expected: integer". Every pointer event failed
+    against a real guest until this was found on a live VM, so it is asserted
+    on the wire format rather than on the helper's own output.
+
+    The previous version of this compared the emitted event against
+    to_axis(), which returns the float -- so it passed while the guest silently
+    ignored every mouse movement. Assert the JSON type, not agreement with the
+    function that caused the bug.
+    """
+    async with stream(harness.base_url) as ws:
+        await send_json(ws, {"type": "config", "vm": "vm-a", "width": 800, "height": 600})
+        await subscribe(ws, "vm-a")
+        harness.qmp("vm-a").clear()
+        # Coordinates chosen so the scaled value is genuinely fractional.
+        for x, y in ((1, 1), (400, 300), (799, 599), (123, 457)):
+            await ws.send_str(json.dumps({"type": "input", "input_type": "mouse_move",
+                                          "x": x, "y": y}))
+            await asyncio.sleep(0.15)
+
+    calls = harness.qmp("vm-a").of("input-send-event")
+    assert calls, "no pointer events reached QMP"
+    seen = 0
+    for call in calls:
+        for event in call["events"]:
+            if event["type"] != "abs":
+                continue
+            seen += 1
+            value = event["data"]["value"]
+            assert isinstance(value, int), (
+                f"axis value must be int for QEMU, got {type(value).__name__}: {value!r}"
+            )
+            assert not isinstance(value, bool)
+            assert 0 <= value <= sb.TABLET_AXIS_MAX
+    assert seen == 8, f"expected 8 axis events across 4 moves, saw {seen}"
 
 
 def test_axis_mapping_clamps_rather_than_wrapping():

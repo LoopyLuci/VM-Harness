@@ -356,7 +356,12 @@ def to_axis(pixel: int, extent: int) -> float:
 
 
 def _abs_event(axis: str, value: float) -> dict:
-    return {"type": "abs", "data": {"axis": axis, "value": value}}
+    # QEMU's input-send-event rejects a float here: "Invalid parameter type for
+    # 'events[0].data.value', expected: integer". to_axis does fractional
+    # scaling to keep pointer motion smooth, so the float has to be rounded at
+    # the boundary rather than at the call site -- and it has to be rounded at
+    # all, or every mouse event fails and the pointer silently never moves.
+    return {"type": "abs", "data": {"axis": axis, "value": int(round(value))}}
 
 
 def _btn_event(button: str, down: bool) -> dict:
