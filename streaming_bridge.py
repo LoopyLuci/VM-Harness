@@ -700,6 +700,11 @@ class VMStreamSource:
         self._encoder = JpegEncoder()
         self._pump: Optional[asyncio.Task] = None
         self._seq = 0
+        # When to next try to un-pause a stalled VM. A stopped guest makes
+        # screendump hang, so the pump has to prod QEMU back to life itself;
+        # waiting for a human to notice a frozen picture is not a streaming
+        # system, it is a response ticket.
+        self._next_resume_at = 0.0
         self.injector = QMPInputInjector(target.name, self.client, tablet_device)
 
     # -- QMP connection -----------------------------------------------------
@@ -887,6 +892,32 @@ class VMStreamSource:
                 self._publish("error", f"capture failed: {exc}")
                 if not getattr(self._client, "is_connected", False):
                     await self._discard_client()
+                # A stopped guest makes the next screendump hang, so the pump
+                # has to bring it back itself. If QEMU simply forgot the VM was
+                # supposed to be running, `cont` is the whole cure; if the
+                # guest genuinely crashed, cont fails and the loop keeps
+                # reporting rather than dying. Rate-limited so a guest that
+                # refuses to wake does not get a stop per frame.
+                if "not running" in str(exc).lower() or "paused" in str(exc).lower():
+                    now = time.monotonic()
+                    if now >= self._next_resume_at:
+                        self._next_resume_at = now + 2.0
+                        try:
+                            client = await self.client()
+                            status = await asyncio.wait_for(
+                                client.send("query-status", {}), timeout=5
+                            )
+                            state = (status.get("return") or {}).get("status", "")
+                            if state == "paused":
+                                await asyncio.wait_for(client.send("cont", {}), timeout=5)
+                                # From here on a screendump is valid again.
+                                self._next_resume_at = time.monotonic() + 1.0
+                                log.info("resumed paused VM %s", self.target.name)
+                        except Exception as resume_exc:  # noqa: BLE001
+                            log.debug(
+                                "resume attempt for %s did not succeed: %s",
+                                self.target.name, resume_exc,
+                            )
             else:
                 self._publish("frame", frame)
             elapsed = time.monotonic() - started
