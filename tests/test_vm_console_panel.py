@@ -1037,3 +1037,53 @@ def test_close_disconnects_the_socket(qtbot, panel):
     panel.close()
     _pump(qtbot, 20)
     assert socket.closed is True
+
+class TestFrameRateDisplay:
+    """The header must report a rate, not just a running total.
+
+    A frame count only says how much has ever arrived; at 3fps and at 60fps it
+    looks the same after a minute. The observed rate is what tells the user
+    whether the console is actually live.
+    """
+
+    def _panel_with(self, qtbot, app):
+        import gui.panels_vm_console as module
+
+        module.SETTINGS_PATH = "fps-probe-settings.json"
+        widget = module.VMConsolePanel()
+        qtbot.addWidget(widget)
+        return widget
+
+    def test_no_fps_before_two_frames(self, qtbot, app):
+        """One frame has no interval, so there is no rate to report."""
+        panel = self._panel_with(qtbot, app)
+        assert panel._observed_fps() is None
+        assert "frames" in panel._frame_summary()
+
+    def test_reports_rate_between_frames(self, qtbot, app):
+        import time
+
+        panel = self._panel_with(qtbot, app)
+        panel._frame_times.clear()
+        panel._frames_received = 2
+        now = time.monotonic()
+        panel._frame_times.extend([now - 1.0, now])  # 1 frame/sec
+        fps = panel._observed_fps()
+        assert fps is not None
+        assert 0.9 < fps < 1.1
+        summary = panel._frame_summary()
+        assert "fps" in summary and "2 frames" in summary
+
+    def test_window_is_bounded(self, qtbot, app):
+        """A long session must not grow the sample list without limit."""
+        panel = self._panel_with(qtbot, app)
+        assert panel._frame_times.maxlen == module_window()
+        for _ in range(panel._frame_times.maxlen + 50):
+            panel._handle_frame(b"\xff\xd8\xff\xe0" + b"\x00" * 64)
+        assert len(panel._frame_times) <= panel._frame_times.maxlen
+
+
+def module_window() -> int:
+    import gui.panels_vm_console as module
+
+    return module._FPS_WINDOW

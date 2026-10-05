@@ -83,7 +83,8 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from collections import deque
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from PyQt5.QtCore import QEvent, QPoint, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QFont, QImage, QPainter, QPixmap
@@ -129,7 +130,10 @@ SETTINGS_PATH = "gui/settings.json"
 SETTINGS_KEY = "vm_console"
 
 #: CredentialStore entry name for the stream bridge token.
-TOKEN_CREDENTIAL_NAME = "Streaming bridge token"
+#: Frames sampled for the observed-fps figure. 120 entries is about two seconds
+#: at 60fps: enough to settle quickly without averaging in the slow start.
+_FPS_WINDOW = 120
+
 
 #: Env var the bridge reads its token from, and therefore the first place this
 #: panel looks.
@@ -247,6 +251,8 @@ class VMConsolePanel(QWidget):
         self._last_frame_time: float = 0.0
         self._frames_received: int = 0
         self._bytes_received: int = 0
+        # Arrival timestamps for the observed-fps figure, bounded.
+        self._frame_times: Deque[float] = deque(maxlen=_FPS_WINDOW)
         self._frame_width: int = 0
         self._frame_height: int = 0
         self._acked_width: int = 0
@@ -874,8 +880,18 @@ class VMConsolePanel(QWidget):
         if name == self._active_vm:
             return
         self._active_vm = name
-        if self._authenticated:
-            self._send_subscribe()
+        # Clear the previous target's verdict. Both labels describe one
+        # specific VM, so leaving them up after a switch is how the panel ended
+        # up claiming "Streaming new-test" and
+        # "unknown VM 'new-test'; known VMs are [...]" while happily streaming
+        # a different machine -- a stale error is worse than no error, because
+        # it looks current.
+        self._error_label.clear()
+        if self._authenticated and name:
+            self._set_status(f"Switching to {name}...", T.WARNING)
+        elif not name:
+            self._set_status("No VM selected", T.TEXT_MUTED)
+        self._send_subscribe()
 
     # ── Configuration messages ───────────────────────────────────────────────
 
@@ -1088,6 +1104,9 @@ class VMConsolePanel(QWidget):
         self._frames_received += 1
         self._bytes_received += len(data)
         self._last_frame_time = time.time()
+        # Sliding window for the observed frame rate, bounded so a long
+        # session cannot grow this without limit.
+        self._frame_times.append(time.monotonic())
 
         if self._frame_update_queued:
             # Recover rather than stay frozen: if the queued repaint is older
@@ -1250,6 +1269,33 @@ class VMConsolePanel(QWidget):
         self._latency_ms = max(0.0, (time.time() - sent) * 1000.0)
         self._latency_label.setText(f"{self._latency_ms:.0f} ms RTT")
 
+    def _observed_fps(self) -> float | None:
+        """Frames per second as this panel actually receives them.
+
+        Measured from arrival timestamps rather than read from the server's own
+        stats. The server counts what it sent; this counts what arrived, which
+        is the number that decides whether the console feels live. A difference
+        between the two means frames are being dropped somewhere in between, and
+        showing only the server's figure would hide that.
+
+        Uses a sliding window so the figure settles quickly instead of
+        averaging in the slow start, and returns None until there are at least
+        two frames to measure between.
+        """
+        stamps = self._frame_times
+        if len(stamps) < 2:
+            return None
+        span = stamps[-1] - stamps[0]
+        if span <= 0:
+            return None
+        return (len(stamps) - 1) / span
+
+    def _frame_summary(self) -> str:
+        fps = self._observed_fps()
+        if fps is None:
+            return f"{self._frames_received} frames"
+        return f"{fps:.1f} fps  |  {self._frames_received} frames"
+
     def _on_stats(self, message: Dict[str, Any]) -> None:
         frames = _as_int(message.get("frames_sent"), -1, 0, 10_000_000)
         sent_bytes = _as_int(message.get("bytes_sent"), -1, 0, 10_000_000_000)
@@ -1261,7 +1307,7 @@ class VMConsolePanel(QWidget):
         else:
             bridge_part = ""
         self._frame_label.setText(
-            f"{self._frames_received} frames"
+            self._frame_summary()
             + ("  (paused)" if self._paused else "")
             + bridge_part
         )
@@ -1591,8 +1637,8 @@ class VMConsolePanel(QWidget):
         if not self._authenticated:
             self._frames_received = 0
             self._bytes_received = 0
-            self._acked_width = 0
-            self._acked_height = 0
+        self._acked_width = 0
+        self._acked_height = 0
 
         self._status_indicator.set_status(running=True, connected=False)
         if not self._authenticated:

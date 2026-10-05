@@ -139,12 +139,18 @@ def dark_palette() -> QPalette:
 # ── Widget Style Generators ─────────────────────────────────────────────────────
 
 def card_style() -> str:
-    """QFrame Card stylesheet."""
+    """QFrame Card stylesheet.
+
+    No box-shadow. Qt's stylesheet engine implements a subset of CSS 2.1 and has
+    no box-shadow at all, so the property was never rendered -- it only made
+    every Card in the window emit "Unknown property box-shadow" to the Qt log,
+    which buried real warnings. Qt shadows are done with
+    QGraphicsDropShadowEffect on the widget, not from a stylesheet.
+    """
     return (
         "background: " + T.BG_SECONDARY + ";"
         "border: 1px solid " + T.BG_TERTIARY + ";"
         "border-radius: " + str(T.R_LG) + "px;"
-        "box-shadow: " + T.SHADOW_SM + ";"
     )
 
 

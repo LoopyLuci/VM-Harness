@@ -153,8 +153,14 @@ MIN_FPS = 1
 _MIN_PACING_WAIT_SEC = 0.005
 #: A screendump is a socket round trip plus a PNG decode plus a JPEG encode.
 #: Asking for more than this cannot make frames arrive faster, only make the
-#: server busy; 60 matches the Rust sidecar on 8446 so both honour one config.
-MAX_FPS = 60
+#: server busy. Raised from 60 to 120 so a fast link can be asked for more.
+#:
+#: Be clear about what this cap is and is not: it is a ceiling on what may be
+#: *requested*, not a promise of what is delivered. Capture is a QMP screendump
+#: -- a socket round trip, a PNG decode and a JPEG encode -- and on a running#: desktop that measured 40-70ms per frame here, so the practical ceiling is
+#: roughly 15-25fps regardless of this number. Reaching 30-60fps, let alone#: 120, needs a transport that streams continuously (VNC or SPICE) rather
+#: than being polled one whole frame at a time.
+MAX_FPS = 120
 DEFAULT_WIDTH = 1920
 DEFAULT_HEIGHT = 1080
 MIN_DIMENSION = 1
