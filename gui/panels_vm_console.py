@@ -26,13 +26,30 @@ unauthenticated path.  Everything after that::
     {"type":"input","input_type":"scroll","dx":<int>,"dy":<int>}
     {"type":"ping","time":<ms>}
     {"type":"stats_request"}
+    {"type":"vm_state","vm":<name>}
 
 Server to client: BINARY frames are raw JPEG with no header and no metadata;
 TEXT frames are JSON -- ``auth_ok``, ``config_ack``, ``pong``, ``stats``,
-``vm_list`` and ``error``.  ``config_ack`` echoes the values actually in force
-after clamping, and those -- not the values requested -- are what the
-coordinates sent to the guest are expressed in, because the bridge divides the
-guest pixel by exactly the width and height it acked.
+``vm_list``, ``vm_state`` and ``error``.  ``config_ack`` echoes the values
+actually in force after clamping, and those -- not the values requested -- are
+what the coordinates sent to the guest are expressed in, because the bridge
+divides the guest pixel by exactly the width and height it acked.
+
+This panel never changes a VM's run state
+------------------------------------------
+There is no Pause *VM* control here, and the ``Pause`` button that does exist is
+strictly local: it freezes the repaint in this window and sends nothing, because
+this panel holds no QMP connection of its own.  Halting a guest from a panel that
+is only watching one is how a console turns into the thing it is supposed to be
+watching, and a frozen picture produced by a guest that has halted looks exactly
+like one produced by this button.
+
+So the guest's run state is *asked for* (``vm_state``) and shown in its own
+label, and it says ``unknown`` whenever the answer is missing, unrecognised, or
+about a VM that is no longer selected.  Frames still arriving is not evidence
+that the guest is running: ``screendump`` returns the last framebuffer of a
+stopped guest indefinitely, which is why "the console looks alive" and "the VM is
+running" are shown separately and neither is inferred from the other.
 
 Ordering guarantee
 ------------------
@@ -168,6 +185,11 @@ KEY_THROTTLE_SEC = 0.04
 STATS_INTERVAL_MS = 2000
 STALE_FRAME_SEC = 15.0
 
+#: Reported run states, and the ones this panel is allowed to display. Anything
+#: else -- including a failed query -- collapses to ``unknown``; see
+#: :meth:`VMConsolePanel._on_vm_state`.
+GUEST_STATE_UNKNOWN = "unknown"
+
 #: Qt key code -> the name to look up in ``_CONTROL_KEYS``.
 _CONTROL_KEY_BY_QT: Dict[int, str] = {
     Qt.Key_Shift: "shift",
@@ -247,6 +269,12 @@ class VMConsolePanel(QWidget):
         self._authenticated = False
         self._paused = False
         self._panning = False
+        # The guest's run state as QMP reports it, and the VM that verdict is
+        # about. Both start unknown/empty: this panel is watching a machine, it
+        # is not running it, so until something authoritative says otherwise the
+        # honest answer is "unknown".
+        self._guest_state: str = GUEST_STATE_UNKNOWN
+        self._guest_state_vm: str = ""
 
         self._last_frame_time: float = 0.0
         self._frames_received: int = 0
@@ -419,8 +447,10 @@ class VMConsolePanel(QWidget):
 
         self._btn_pause = self._ghost_button("Pause")
         self._btn_pause.setToolTip(
-            "Stop painting new frames. The stream keeps running and the frame "
-            "counter keeps climbing; only the picture freezes."
+            "Freeze the picture in THIS window. Nothing is sent to the VM: "
+            "the guest keeps running, the stream keeps running and the frame "
+            "counter keeps climbing. The guest's real run state is shown "
+            "separately below the video, read from QMP."
         )
         self._btn_pause.clicked.connect(self._toggle_pause)
 
@@ -601,6 +631,25 @@ class VMConsolePanel(QWidget):
         )
         self._latency_label.setToolTip("Round trip time of the last ping")
         rl.addWidget(self._latency_label)
+
+        # The guest's own run state, as QMP reports it. Deliberately a separate
+        # label from the frame counter and from the Pause button: this panel
+        # watching a VM says nothing about whether that VM is running, and
+        # frames arriving is not evidence either -- `screendump` keeps returning
+        # the last framebuffer of a stopped guest indefinitely, so "the console
+        # looks alive" and "the guest is running" are independent facts and are
+        # shown as such. Anything the bridge could not read says "unknown"
+        # rather than guessing.
+        self._guest_state_label = QLabel("guest: unknown")
+        self._guest_state_label.setStyleSheet(
+            f"color: {T.TEXT_MUTED}; font-size: 11px; font-weight: 600;"
+        )
+        self._guest_state_label.setToolTip(
+            "The guest's run state, read from QMP `query-status` by the bridge. "
+            "'unknown' means the query failed or has not answered yet -- this "
+            "panel will not report 'paused' it has not been told."
+        )
+        rl.addWidget(self._guest_state_label)
 
         rl.addStretch()
 
@@ -887,6 +936,9 @@ class VMConsolePanel(QWidget):
         # a different machine -- a stale error is worse than no error, because
         # it looks current.
         self._error_label.clear()
+        # A verdict about the previous VM is worse than no verdict: it reads as
+        # a statement about the machine now on screen.
+        self._reset_guest_state()
         if self._authenticated and name:
             self._set_status(f"Switching to {name}...", T.WARNING)
         elif not name:
@@ -940,6 +992,9 @@ class VMConsolePanel(QWidget):
             return
         self._send_json({"type": "stats_request"})
         self._send_ping()
+        # Ask what the guest is actually doing, rather than letting the user
+        # infer it from a picture that keeps arriving.
+        self._send_json({"type": "vm_state", "vm": self.selected_vm()})
 
     def _send_ping(self) -> None:
         stamp = int(time.time() * 1000)
@@ -1183,6 +1238,8 @@ class VMConsolePanel(QWidget):
             self._on_pong(message)
         elif kind == "stats":
             self._on_stats(message)
+        elif kind == "vm_state":
+            self._on_vm_state(message)
         elif kind == "vm_list":
             vms = message.get("vms")
             if isinstance(vms, list):
@@ -1205,6 +1262,7 @@ class VMConsolePanel(QWidget):
         self._send_config()
         self._send_subscribe()
         self._send_ping()
+        self._send_json({"type": "vm_state", "vm": self.selected_vm()})
         self._stats_timer.start()
         self._graphics_view.setFocus(Qt.OtherFocusReason)
 
@@ -1322,6 +1380,53 @@ class VMConsolePanel(QWidget):
             "bytes_sent": sent_bytes,
             "fps": fps,
         })
+
+    def _on_vm_state(self, message: Dict[str, Any]) -> None:
+        """Show the guest's real run state, and only what was actually said.
+
+        Three rules, each of which exists because the alternative produced a
+        confident wrong answer about a VM nobody had paused:
+
+        1. A verdict about a VM this panel is no longer showing is dropped. A
+           ``query-status`` issued before a VM switch can land after it, and
+           "guest: paused" under a picture of a different machine is the exact
+           shape of this bug.
+        2. A state this panel does not recognise -- including a missing field --
+           becomes ``unknown``. The only way to say "paused" here is for the
+           bridge to have sent the word "paused".
+        3. A failed query becomes ``unknown``, never "paused". Not being able to
+           ask is not the same answer as being told the guest stopped.
+        """
+        vm = str(message.get("vm", "")).strip()
+        if not vm or vm != self.selected_vm():
+            return
+        state = message.get("state")
+        if not isinstance(state, str) or not state.strip():
+            state = GUEST_STATE_UNKNOWN
+        state = state.strip().lower()
+        if state not in ("running", "paused", "shutdown", "prelaunch",
+                         "suspended", "guest-panicked", "watchdog",
+                         "io-error", "internal-error", "shutdown-pending"):
+            state = GUEST_STATE_UNKNOWN
+        self._guest_state = state
+        self._guest_state_vm = vm
+        self._update_guest_state_label()
+
+    def _update_guest_state_label(self) -> None:
+        colour = T.SUCCESS if self._guest_state == "running" else (
+            T.WARNING if self._guest_state == "paused" else T.TEXT_MUTED
+        )
+        self._guest_state_label.setText(f"guest: {self._guest_state}")
+        self._guest_state_label.setStyleSheet(
+            f"color: {colour}; font-size: 11px; font-weight: 600;"
+        )
+
+    def _reset_guest_state(self) -> None:
+        """Forget the last verdict: it described a machine that is no longer on
+        screen, or a connection that no longer exists."""
+        self._guest_state = GUEST_STATE_UNKNOWN
+        self._guest_state_vm = ""
+        self._update_guest_state_label()
 
     def _on_server_error(self, message: str) -> None:
         self._error_label.setText(message)
@@ -1568,17 +1673,39 @@ class VMConsolePanel(QWidget):
     # ── Controls ─────────────────────────────────────────────────────────────
 
     def _toggle_pause(self) -> None:
+        """Freeze this window's picture. Local only -- nothing is sent.
+
+        This button has never had a QMP connection and still does not: it is
+        the one control on a console panel that must not be able to halt the
+        guest it is showing, because a panel that is "merely watching" a VM has
+        no business changing its run state.
+
+        Refused outright while disconnected rather than flipping the flag. A
+        freeze applied to a panel with no stream is a lie about what is being
+        shown, and the requirement it exists to satisfy -- no run-state change
+        without a live, explicit action -- does not need a disconnected panel
+        pretending otherwise.
+        """
+        if not self._connected:
+            self._set_status("Disconnected", T.STATUS_STOPPED)
+            self._hint(
+                "Pause refused: not connected to the bridge, so there is no "
+                "stream to freeze"
+            )
+            return
         self._paused = not self._paused
         self._btn_pause.setText("Resume" if self._paused else "Pause")
         if not self._paused and self._last_image is not None \
                 and not self._last_image.isNull():
             self._paint(self._last_image)
         self._update_frame_stats()
-        if not self._connected:
-            self._set_status("Disconnected", T.STATUS_STOPPED)
-        elif self._paused:
+        if self._paused:
+            # Say what actually happened. "Paused" unqualified reads as a
+            # statement about the guest, which this button does not know.
             self._set_status(
-                "Paused - frames still arriving, picture frozen", T.WARNING
+                f"Picture frozen here - the guest is not paused "
+                f"(guest: {self._guest_state})",
+                T.WARNING,
             )
         else:
             self._set_status(
@@ -1653,6 +1780,7 @@ class VMConsolePanel(QWidget):
         with self._send_lock:
             self._authenticated = False
         self._stats_timer.stop()
+        self._reset_guest_state()
         self._update_disconnected_state()
 
     def _handle_ws_error(self, message: str) -> None:
@@ -1661,6 +1789,7 @@ class VMConsolePanel(QWidget):
         with self._send_lock:
             self._authenticated = False
         self._stats_timer.stop()
+        self._reset_guest_state()
         self._set_status(f"Error: {message[:80]}", T.ERROR)
         self._apply_control_enabled_state()
 
@@ -1685,6 +1814,7 @@ class VMConsolePanel(QWidget):
 
     def _update_disconnected_state(self) -> None:
         self._status_indicator.set_status(running=False, connected=False)
+        self._reset_guest_state()
         self._set_status("Disconnected", T.STATUS_STOPPED)
         self._apply_control_enabled_state()
         self._set_placeholder("Disconnected - choose a VM and press Connect")

@@ -3,9 +3,22 @@
 Provides Start, Stop, Reset, Suspend, Resume, Eject ISO controls
 wired to the MultiVMQMPBridge for context-aware VM operations.
 Switches context based on the currently selected VM.
+
+Suspend and Resume are scoped, and differently so from the rest
+-------------------------------------------------------------
+``stop``/``cont`` change whether the guest executes at all, and the failure mode
+is unusually quiet: a stopped guest keeps answering ``screendump`` with its last
+frame, so the console still looks alive while every ``input-send-event`` fails
+with "VM not running". A pause issued at the wrong moment, or against the wrong
+VM, is invisible from the GUI and indistinguishable from a VM that halted on its
+own. Those two handlers therefore capture the VM at button-press time and refuse
+the command unless that VM is still the one this panel drives over a live QMP
+session — see :meth:`VMControlPanel._scoped_bridge`.
 """
 
 from __future__ import annotations
+
+from typing import Optional
 
 from gui.theme import T
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
@@ -252,8 +265,12 @@ class VMControlPanel(QWidget):
         self._lifecycle_btns["Start"].clicked.connect(self._on_start)
         self._lifecycle_btns["Stop"].clicked.connect(self._on_stop)
         self._lifecycle_btns["Reset"].clicked.connect(self._on_reset)
-        self._lifecycle_btns["Suspend"].clicked.connect(self._on_suspend)
-        self._lifecycle_btns["Resume"].clicked.connect(self._on_resume)
+        self._lifecycle_btns["Suspend"].clicked.connect(
+            lambda *_: self._on_suspend(self._active_vm)
+        )
+        self._lifecycle_btns["Resume"].clicked.connect(
+            lambda *_: self._on_resume(self._active_vm)
+        )
         self._lifecycle_btns["Eject ISO"].clicked.connect(self._on_eject)
 
         # ── Status timer ───────────────────────────────────────────────────────
@@ -323,10 +340,9 @@ class VMControlPanel(QWidget):
         """Switch the control panel context to a specific VM."""
         self._active_vm = vm_name
 
-        # Build the bridge for this VM from the shared manager. MultiVMQMPBridge
-        # is constructed per VM (it takes a name and a QMP URI), so there is no
-        # single instance to hand around -- previously the panel was given a
-        # single-VM QMPBridge that had none of the methods called here.
+        # Build the bridge for this VM from the shared manager. See
+        # _rebuild_bridge for why the construction goes through the manager's
+        # URI rather than passing a name and a URI positionally.
         self._rebuild_bridge(vm_name)
 
         self._update_context_display()
@@ -335,6 +351,22 @@ class VMControlPanel(QWidget):
         self._refresh_credential_summary()
 
     def _rebuild_bridge(self, vm_name: str) -> None:
+        """Give this panel a QMP bridge that actually addresses ``vm_name``.
+
+        ``MultiVMQMPBridge.__init__`` is ``(mode="switch", parent=None)``, so it
+        takes no VM name and no URI. This used to call
+        ``MultiVMQMPBridge(vm_name, uri)``, which put the VM name in ``mode`` and
+        the URI in ``parent``: the QObject parent was silently ``None``, no VM was
+        ever registered, and ``active_vm`` stayed unset. Every lifecycle command
+        on this panel resolves its target through ``active_vm``, so Suspend, Stop,
+        Reset and Resume all did nothing at all, while the panel reported success.
+
+        The VM is registered with ``add_vm`` and then made active with
+        ``switch_to_vm``, which is the sequence that sets ``active_vm`` and (in
+        switch mode) lazily creates the per-VM bridge carrying the URI. Passing the
+        name and URI positionally cannot work, so it is worth saying so here rather
+        than letting the next reader "simplify" it back.
+        """
         from gui.multi_vm_qmp_bridge import MultiVMQMPBridge
 
         if self._multi_qmp:
@@ -343,15 +375,27 @@ class VMControlPanel(QWidget):
             except Exception:  # noqa: BLE001 - a stale bridge must not block switching
                 pass
             self._multi_qmp = None
+            self._bridge_error = ""
 
         if not self._manager:
             return
         uri = self._manager.get_qmp_uri(vm_name)
         if not uri:
+            self._bridge_error = f"no QMP URI configured for {vm_name}"
             return
         try:
-            self._multi_qmp = MultiVMQMPBridge(vm_name, uri)
-        except Exception as exc:  # noqa: BLE001
+            bridge = MultiVMQMPBridge(mode="switch")
+            bridge.connected.connect(self._on_bridge_connected)
+            bridge.error.connect(self._on_bridge_error)
+            bridge.active_vm_changed.connect(self._on_active_vm_changed)
+            bridge.command_result.connect(self._on_command_result)
+            bridge.add_vm(vm_name, uri)
+            # switch_to_vm is what sets active_vm. Without it the lifecycle
+            # handlers below have no target and no-op silently.
+            bridge.switch_to_vm(vm_name, uri)
+            self._multi_qmp = bridge
+        except Exception as exc:  # noqa: BLE001 - a bad URI must not kill the panel
+            self._multi_qmp = None
             self._bridge_error = str(exc)
 
     def _update_context_display(self):
@@ -456,17 +500,82 @@ class VMControlPanel(QWidget):
             self._multi_qmp.system_reset()
             self._show_info("Resetting VM...", success=True)
 
-    def _on_suspend(self):
-        """Suspend the active VM."""
-        if self._multi_qmp:
-            self._multi_qmp.stop_vm()
-            self._show_info("Suspending VM...", success=True)
+    def _scoped_bridge(self, vm_name: Optional[str], action: str):
+        """The bridge allowed to run a run-state change, or ``None`` (refused).
 
-    def _on_resume(self):
-        """Resume the active VM."""
-        if self._multi_qmp:
-            self._multi_qmp.cont()
-            self._show_info("Resuming VM...", success=True)
+        ``stop`` and ``cont`` are not like the other lifecycle buttons: ``stop``
+        halts the guest, and a halted guest still answers ``screendump`` with its
+        last frame while refusing every ``input-send-event``. A pause that lands
+        on the wrong VM is therefore invisible from the console and looks exactly
+        like a VM that stopped by itself.
+
+        ``MultiVMQMPBridge`` resolves its target from ``active_vm`` at the moment
+        the command is issued, so a click made while one VM was selected would
+        act on whatever was selected by the time the command was dispatched.
+        The VM is therefore captured at press time and re-checked here, and the
+        request is refused rather than re-pointed when it no longer matches, or
+        when there is no connected QMP session for it.
+        """
+        if not vm_name:
+            self._show_info(f"{action} refused: no VM selected", success=False)
+            return None
+        if vm_name != self._active_vm:
+            self._show_info(
+                f"{action} refused: the selection moved from {vm_name} to "
+                f"{self._active_vm or 'nothing'} after the button was pressed",
+                success=False,
+            )
+            return None
+        bridge = self._multi_qmp
+        if bridge is None:
+            self._show_info(
+                f"{action} refused: no QMP bridge for {vm_name}", success=False
+            )
+            return None
+        if bridge.active_vm != vm_name:
+            self._show_info(
+                f"{action} refused: the QMP bridge is driving "
+                f"{bridge.active_vm or 'nothing'}, not {vm_name}",
+                success=False,
+            )
+            return None
+        per_vm = bridge.get_bridge(vm_name)
+        if per_vm is None or not per_vm.is_connected:
+            self._show_info(
+                f"{action} refused: no QMP connection to {vm_name}", success=False
+            )
+            return None
+        return bridge
+
+    def _on_suspend(self, vm_name: Optional[str] = None):
+        """Suspend (QMP ``stop``) the VM that was selected when this was pressed.
+
+        Only ever reached from the Suspend button, and only after
+        :meth:`_scoped_bridge` has confirmed that VM is still the one this panel
+        is driving over a live QMP session. See that method for why the target
+        is captured at press time instead of being resolved when the command is
+        issued.
+        """
+        vm = vm_name if vm_name is not None else self._active_vm
+        bridge = self._scoped_bridge(vm, "Suspend")
+        if bridge is None:
+            return
+        bridge.stop_vm()
+        self._show_info(f"Suspending {vm}...", success=True)
+
+    def _on_resume(self, vm_name: Optional[str] = None):
+        """Resume (QMP ``cont``) the VM that was selected when this was pressed.
+
+        Scoped exactly as :meth:`_on_suspend` is: ``cont`` sent to the wrong VM
+        is harmless to that VM but leaves the one that was actually paused frozen,
+        which is the other half of the same confusing picture.
+        """
+        vm = vm_name if vm_name is not None else self._active_vm
+        bridge = self._scoped_bridge(vm, "Resume")
+        if bridge is None:
+            return
+        bridge.cont()
+        self._show_info(f"Resuming {vm}...", success=True)
 
     def _on_eject(self):
         """Eject CD-ROM on the active VM."""

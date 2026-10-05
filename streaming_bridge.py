@@ -39,6 +39,22 @@ Robustness rules the GUI depends on
   loop keeps running: a VM that is momentarily paused degrades to a frozen
   picture rather than a dead socket.
 
+This bridge never changes a VM's run state
+------------------------------------------
+It holds a QMP connection to every VM it streams, which makes ``stop`` a command
+away from every client on the wire -- and ``stop`` is not a cosmetic operation:
+it halts the guest, so ``screendump`` goes on returning the *same* frozen frame
+while ``input-send-event`` starts failing with "VM not running". That is
+indistinguishable, from the console, from a VM that halted by itself, and it is
+why the run state reported here (:meth:`VMStreamSource.run_state`) is read from
+QMP rather than guessed from whether frames are still arriving.
+
+A viewer must not be able to stop what it is watching, so every message type that
+would halt, resume or otherwise reconfigure a guest is refused with an error
+(see :data:`_RUN_STATE_MESSAGE_TYPES`) rather than silently ignored: "ignored" is
+indistinguishable from "not implemented", and a client that believes it paused a
+VM when it did not is worse off than one that was told no.
+
 Security
 --------
 The listener binds ``127.0.0.1`` only (``VMHARNESS_BRIDGE_HOST`` overrides it,
@@ -186,6 +202,38 @@ _LANCZOS = getattr(getattr(Image, "Resampling", Image), "LANCZOS", 1)
 
 _CONTAINER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _HMP_KEY_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]*$")
+
+#: Client message types that would change a guest's run state, and that this
+#: bridge therefore refuses. Two families are covered:
+#:
+#: * the lifecycle verbs themselves (``stop``, ``pause``, ``cont``, ...), and
+#: * ``human-monitor-command``, which is the interesting one -- it is a verbatim
+#:   HMP escape hatch, so "let the client send HMP" would be "let the client
+#:   send ``stop``" wearing a hat, and this bridge already uses HMP internally
+#:   only to reach ``sendkey``.
+#:
+#: A ``type`` that merely *sounds* dangerous is not enough reason to reject it,
+#: which is why the set is an explicit allow-list-by-exclusion rather than a
+#: pattern: a new client feature must not be refused by accident.
+_RUN_STATE_MESSAGE_TYPES = frozenset({
+    "cont",
+    "hmp",
+    "human-monitor-command",
+    "pause",
+    "qmp",
+    "qmp_command",
+    "resume",
+    "set_state",
+    "stop",
+    "suspend",
+    "system_stop",
+    "unpause",
+    "vm_pause",
+    "vm_resume",
+    "vm_state_change",
+    "vm.stop",
+    "vm.pause",
+})
 
 
 def _clamp(value: int, low: int, high: int) -> int:
@@ -732,6 +780,42 @@ class VMStreamSource:
         image = await self.capture_image()
         self._seq += 1
         return Frame(image=image, seq=self._seq, captured_at=time.monotonic())
+
+    async def run_state(self) -> Dict[str, Any]:
+        """The guest's real run state, from QMP, reported honestly.
+
+        ``query-status`` is the only thing that knows. Frames still arriving is
+        *not* evidence that the guest is running -- ``screendump`` happily
+        returns the last framebuffer of a stopped VM forever -- so nothing here
+        is inferred from the capture loop.
+
+        A failed query, a reply without a ``status`` field, or an exception all
+        report ``unknown``. Guessing "paused" from a QMP hiccup is the one
+        inference that is both wrong and dangerous: it turns a transient socket
+        error into a story about a guest that stopped by itself, which is
+        precisely the story that sent someone looking for a pause button that
+        never existed.
+        """
+        try:
+            client = await self.client()
+            reply = await client.send("query-status")
+        except Exception as exc:
+            log.warning("query-status failed for VM %s: %s", self.target.name, exc)
+            return {"state": "unknown", "running": None}
+        if not isinstance(reply, dict):
+            return {"state": "unknown", "running": None}
+        # ``QMPClient.send`` hands back the whole envelope, but a test double (or
+        # a future client) may answer with the return value alone.
+        inner = reply.get("return")
+        body = inner if isinstance(inner, dict) else reply
+        status = body.get("status")
+        if not isinstance(status, str) or not status:
+            return {"state": "unknown", "running": None}
+        running = body.get("running")
+        return {
+            "state": status,
+            "running": running if isinstance(running, bool) else None,
+        }
 
     # -- subscribers --------------------------------------------------------
 
@@ -1313,6 +1397,16 @@ class StreamingBridge:
             return
 
         msg_type = message.get("type")
+        if isinstance(msg_type, str) and msg_type in _RUN_STATE_MESSAGE_TYPES:
+            # Refused, not ignored: see the module docstring. A client that was
+            # told "no" can go and use a control; a client that was told
+            # nothing goes on believing the guest stopped.
+            await self._send_error(
+                session,
+                f"the streaming bridge never changes a VM's run state; "
+                f"{msg_type!r} is refused",
+            )
+            return
         if msg_type == "config":
             await self._handle_config(session, message)
         elif msg_type == "subscribe":
@@ -1330,11 +1424,37 @@ class StreamingBridge:
             })
         elif msg_type == "vm_list":
             await self._send_json(session, {"type": "vm_list", "vms": self.registry.list_vms()})
+        elif msg_type == "vm_state":
+            await self._handle_vm_state(session, message.get("vm"))
         else:
             # Unknown types are ignored, not errors: a client a version ahead of
             # the server must not lose its connection over a feature the server
             # does not implement.
             log.debug("ignoring unrecognised message type %r from %s", msg_type, session.client_id)
+
+    async def _handle_vm_state(self, session: ClientSession, vm: Any) -> None:
+        """Answer ``vm_state``: the guest's run state, read from QMP.
+
+        The VM defaults to the one this session is subscribed to, so the reply
+        always names the machine it describes -- a client cannot end up showing
+        one VM's verdict beside another's picture.
+        """
+        name = vm if isinstance(vm, str) and vm else session.vm
+        if not name:
+            await self._send_error(
+                session,
+                "vm_state needs a VM: subscribe first, or send {\"vm\": <name>}",
+            )
+            return
+        target = self.registry.get(name)
+        if target is None:
+            await self._send_error(
+                session,
+                f"unknown VM {name!r}; known VMs are {self.registry.list_vms()}",
+            )
+            return
+        state = await self.source_for(target).run_state()
+        await self._send_json(session, {"type": "vm_state", "vm": target.name, **state})
 
     async def _handle_config(self, session: ClientSession, message: dict) -> None:
         """Apply per-client config. Nothing here touches another session."""

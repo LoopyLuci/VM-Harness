@@ -24,6 +24,7 @@ import shutil
 import time
 import urllib.parse
 import urllib.request
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -743,6 +744,280 @@ def _add_iso_ops(cat: Catalog, engine: Engine) -> None:
         return {"deleted": str(p)}
 
 
+# ---- topology & cluster ---------------------------------------------------------------------------------------------
+# The operations here answer "what is actually there, and can I reach it?" -- and
+# they are written so that a fact nobody measured never comes back as if it were
+# one. Every endpoint carries a provenance, and a node nobody has heard from is
+# reported as `unknown`, never as `down`.
+
+def cluster_config_path(engine: Engine) -> Path:
+    """Where the cluster config lives.
+
+    Sits beside the other VM-Harness state so a backup of the home directory
+    carries the cluster topology with it. A missing file is an empty cluster, not
+    an error: single-node installations have no reason to write one.
+    """
+    return home() / "cluster.json"
+
+
+def _registry_from(engine: Engine) -> Any:
+    """Build a registry from the persisted cluster config.
+
+    Every op that touches the cluster goes through this so there is one place
+    that knows where the config is and one interpretation of it.
+    """
+    from vm_harness.cluster import ClusterConfig, NodeRegistry
+
+    return NodeRegistry(ClusterConfig.load(cluster_config_path(engine)))
+
+
+def _endpoint_from_vm(name: str, backend: str, status: Any) -> Any:
+    """Describe one VM as an endpoint, without guessing at what is unknown.
+
+    Provenance per field, not per endpoint. A backend that answered is reporting
+    the run state; the management URI it hands back is what the *host* believes the
+    forward to be, which is an inference until something connects to it -- so the
+    forward is modelled as ``INFERRED`` even though the URI came from a runtime.
+
+    Addresses stay ``unknown`` unless the status actually carries one. A stopped VM
+    with no address is the common case, and filling it in from the VM's name or the
+    host's own IP would be a fabrication.
+    """
+    import enum as _enum
+    import urllib.parse
+
+    from vm_harness.cluster import Endpoint, EndpointKind, Provenance, vm_forwards
+
+    raw_state = getattr(status, "state", None)
+    state = raw_state.value if isinstance(raw_state, _enum.Enum) else str(raw_state or "")
+    state = state or "unknown"
+
+    # The management URI is a QMP endpoint (tcp://host:port), which is the one
+    # forward a harness-launched VM is certain to have. SSH is not in VMStatus, so
+    # it is not invented here -- an SSH forward the backend never mentioned would be
+    # a config-shaped guess presented as a fact.
+    forwards: list[Any] = []
+    management_uri = str(getattr(status, "management_uri", "") or "")
+    if management_uri:
+        parsed = urllib.parse.urlparse(management_uri)
+        if parsed.port and parsed.scheme in ("tcp", "http", "https"):
+            forwards.extend(vm_forwards(name, qmp_port=parsed.port,
+                                        host=parsed.hostname or "127.0.0.1"))
+
+    address = str(getattr(status, "ip_address", "") or "")
+    host_ip = str(getattr(status, "host_ip", "") or "")
+
+    return Endpoint(
+        id=name,
+        kind=EndpointKind.VM,
+        labels={"backend": backend},
+        addresses=[a for a in (address, host_ip) if a],
+        # Reported by the backend, but only when it is non-empty; otherwise the VM
+        # simply has not told us and "unknown" is the honest answer.
+        addresses_provenance=Provenance.REPORTED if address else Provenance.UNKNOWN,
+        state=state,
+        state_provenance=Provenance.REPORTED if state != "unknown" else Provenance.UNKNOWN,
+        ports=forwards,
+    )
+
+
+def _add_topology_ops(cat: Catalog, engine: Engine) -> None:
+    @cat.op("topology.list", group="topology")
+    async def topology_list(backend: str = "", verify: bool = False,
+                            timeout: float = 2.0) -> dict:
+        """Every VM here as a network endpoint: its state, its addresses, its port forwards
+
+        Addresses come back as `unknown` unless something reported them -- a VM
+        being listed does not mean anyone knows its IP, and guessing one from a
+        config would be worse than saying nothing.
+
+        With `verify=true` each forward is actually connected to, so its
+        reachability is observed rather than read from the config. That is a real
+        socket connect per port and runs off the event loop, so the caller's
+        timeout is per port, not total."""
+        from vm_harness.cluster import (Endpoint, EndpointKind, Link, LinkKind,
+                                        Provenance, Topology, container_api_forward,
+                                        layer2_capability)
+        from vm_harness.cluster.network import ReachabilityVerifier
+
+        names = [backend] if backend else await engine.available_hypervisors()
+        topology = Topology()
+
+        async def one(bname: str) -> list[Any]:
+            try:
+                b = await engine.hypervisor(bname)
+                vms = await b.list_vms()
+            except Exception:  # noqa: BLE001 - one absent hypervisor must not hide the rest
+                return []
+            out = []
+            for vm in vms:
+                try:
+                    status = await b.get_status(vm)
+                except Exception:  # noqa: BLE001 - status failure is unknown, not absent
+                    status = None
+                out.append(_endpoint_from_vm(vm, bname, status))
+            return out
+
+        gathered = await asyncio.gather(*(one(n) for n in names), return_exceptions=True)
+        for result in gathered:
+            if isinstance(result, Exception):
+                continue
+            topology.endpoints.extend(result)
+
+        # The container engine's API endpoint, modelled rather than discovered:
+        # Docker Desktop speaks a named pipe, so this is frequently not a TCP
+        # port at all and the note says so.
+        try:
+            container_ok = bool((await engine.container_engines()).get("docker"))
+        except Exception:  # noqa: BLE001
+            container_ok = False
+        if container_ok:
+            topology.endpoints.append(Endpoint(
+                id="docker-api", kind=EndpointKind.CONTAINER,
+                labels={"engine": "docker"},
+                state="unknown", state_provenance=Provenance.UNKNOWN,
+                ports=[container_api_forward()],
+            ))
+
+        # Only the local host's forwards are modelled as links to it. This host
+        # cannot bridge a container to a VM, so no L2 link is ever asserted here.
+        host = Endpoint(id="host", kind=EndpointKind.HOST, state="local",
+                        state_provenance=Provenance.OBSERVED)
+        topology.endpoints.append(host)
+        for ep in topology.endpoints:
+            for f in ep.ports:
+                topology.links.append(Link(
+                    source="host", target=ep.id, kind=LinkKind.PORT_FORWARD,
+                    detail=f"{f.host}:{f.port} ({f.purpose})",
+                    provenance=Provenance.INFERRED,
+                ))
+
+        if verify:
+            # Verification rebuilds the endpoints rather than editing them: a
+            # PortForward is frozen so that "what we modelled" stays recoverable
+            # after "what we measured" arrives.
+            budget = max(0.1, float(timeout))
+            verifier = ReachabilityVerifier(timeout=budget)
+            results = await verifier.check_many_async(
+                [(f.host, f.port) for ep in topology.endpoints for f in ep.ports],
+                timeout=budget,
+            )
+            by_key = {(r.host, r.port): r for r in results}
+            measured: list[Any] = []
+            for ep in topology.endpoints:
+                if not ep.ports:
+                    measured.append(ep)
+                    continue
+                rebuilt = []
+                for f in ep.ports:
+                    result = by_key.get((f.host, f.port))
+                    if result is None:
+                        rebuilt.append(f)
+                        continue
+                    rebuilt.append(replace(
+                        f,
+                        provenance=result.provenance,
+                        note=(f"connected in {result.latency_ms:.0f} ms" if result.reachable
+                              else f"{result.reachability.value}: {result.detail}"),
+                    ))
+                measured.append(replace(ep, ports=rebuilt))
+            topology.endpoints = measured
+
+        can_l2, why = await asyncio.to_thread(layer2_capability)
+        if not can_l2:
+            topology.limitations.append(why)
+        return topology.to_dict()
+
+    @cat.op("topology.reach", group="topology")
+    async def topology_reach(host: str, port: int, timeout: float = 2.0) -> dict:
+        """Try to connect to one host:port and report what happened
+
+        The three answers are kept apart on purpose: `reachable` (a connect
+        completed), `refused` (the host answered no -- nothing listening) and
+        `timeout` (nothing answered at all). A refused QMP port means QEMU is
+        running without that forward; a timeout means the guest's network is
+        wrong, and they call for different fixes."""
+        from vm_harness.cluster.network import tcp_probe
+
+        budget = max(0.1, float(timeout))
+        result = await asyncio.to_thread(tcp_probe, host, int(port), budget)
+        return result.to_dict()
+
+    @cat.op("topology.limits", group="topology")
+    async def topology_limits() -> dict:
+        """What this host cannot do at the network layer, and why
+
+        On Windows with WHPX there is no way to put a Docker Desktop container and
+        a VM on one layer-2 segment: the two live in different stacks and the Linux
+        bridge helpers do not exist here. Ask before building a topology that needs
+        it, rather than discovering it from a timeout."""
+        from vm_harness.cluster import layer2_capability
+
+        can_l2, why = await asyncio.to_thread(layer2_capability)
+        return {"l2_bridge": can_l2, "reason": why,
+                "workarounds": ["host port forwarding (QMP and SSH forwards)",
+                                "put the VM and the container on the same external network"]
+                if not can_l2 else []}
+
+    @cat.op("cluster.status", group="cluster")
+    async def cluster_status() -> dict:
+        """Every configured node, its health, and its capacity
+
+        `unknown` means we have not heard from a node. That is not the same as
+        `down` and is never reported as such: silence is indistinguishable from a
+        paused node, a severed network and a frozen process, and only one of those
+        is something to act on. A node becomes `down` only when a connection to a
+        node we had heard from actually failed."""
+        registry = await asyncio.to_thread(_registry_from, engine)
+        return registry.to_dict()
+
+    @cat.op("cluster.place", group="cluster")
+    async def cluster_place(capabilities: Optional[list[str]] = None, slots: int = 1,
+                            name: str = "", node: str = "",
+                            allow_stale: bool = True) -> dict:
+        """Choose which node should run a piece of work, by capability and free capacity
+
+        Only nodes that have sent a recent heartbeat are eligible, because a node's
+        capacity is taken from what it reported rather than from what someone typed
+        into a config file. Among eligible nodes the one with the most free capacity
+        wins, with node id as a deterministic tie-break.
+
+        If nothing fits this fails with a per-node reason and places nothing. It
+        does not fall back to a different node: work that lands on a machine you did
+        not choose is work you will not find when you go looking for it."""
+        from vm_harness.cluster import PlacementError, Scheduler, WorkRequest
+
+        registry = await asyncio.to_thread(_registry_from, engine)
+        scheduler = Scheduler(registry)
+        request = WorkRequest(
+            name=name,
+            capabilities=frozenset(capabilities or ()),
+            slots=int(slots),
+            pin_node=node,
+            allow_stale=bool(allow_stale),
+        )
+        try:
+            placement = scheduler.place(request)
+        except PlacementError as exc:
+            raise OperationError(exc.describe(), code="no_capacity", status=409)
+        scheduler.commit(placement)
+        return placement.to_dict()
+
+    @cat.op("cluster.failover", group="cluster")
+    async def cluster_failover() -> dict:
+        """What survives a node disappearing: what is retried, and what is not
+
+        Placement decisions are pure and always safe to redo. Starting or stopping
+        a VM may be retried with the understanding that the first attempt might
+        have succeeded before the node went away, so the operation could run twice.
+        Anything destructive -- deleting a disk, writing files into a guest, running
+        a guest command -- is never retried automatically, because a node vanishing
+        is exactly the moment a blind retry does the most damage."""
+        from vm_harness.cluster import DEFAULT_FAILOVER
+
+        return DEFAULT_FAILOVER.to_dict()
+
+
 # ---- audit ---------------------------------------------------------------------------------------------------------
 def _add_audit_ops(cat: Catalog, audit: Any) -> None:
     @cat.op("audit.query", group="audit")
@@ -767,6 +1042,7 @@ def build_catalog(engine: Engine, audit: Any = None) -> Catalog:
     _add_compose_ops(cat, engine)
     _add_k8s_ops(cat, engine)
     _add_iso_ops(cat, engine)
+    _add_topology_ops(cat, engine)
     if audit is not None:
         _add_audit_ops(cat, audit)
     return cat

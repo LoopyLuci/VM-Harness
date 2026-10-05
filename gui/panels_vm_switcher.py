@@ -12,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from gui.theme import T
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
     QMessageBox, QListWidget, QListWidgetItem, QInputDialog, QFileDialog,
@@ -22,6 +22,49 @@ from PyQt5.QtWidgets import (
 from gui.widgets import Card, StatusIndicator, SectionHeader
 from gui.multi_vm import MultiVMManager, GLOBAL_MAX_RAM_MB, GLOBAL_MAX_CPUS
 from gui.vm_cloner import CloneDialog, TemplateManagerDialog, TemplateManager, QEMU_IMG_DEFAULT
+
+
+#: Per-probe budget. Long enough to cross a LAN hop, short enough that two
+#: unresponsive ports do not leave the panel "checking…" for a minute.
+REACHABILITY_TIMEOUT = 1.5
+
+
+class _ReachabilityWorker(QThread):
+    """Probes a VM's port forwards off the GUI thread.
+
+    ``QThread`` rather than a thread pool because these are one-shot bursts tied
+    to a button press, and the result has to come back as a Qt signal to be
+    delivered on the GUI thread. Probing inline would freeze the whole window for
+    ``timeout`` per unreachable port.
+    """
+
+    done = pyqtSignal(dict)          # {"qmp": probe_result_dict, ...}
+
+    def __init__(self, parent, forwards: list, timeout: float = REACHABILITY_TIMEOUT) -> None:
+        super().__init__(parent)
+        self._forwards = list(forwards)
+        self._timeout = timeout
+
+    def run(self) -> None:
+        """Do the connects and emit. Never raises: a failed probe is a result."""
+        from vm_harness.cluster.network import ReachabilityVerifier
+
+        verifier = ReachabilityVerifier(timeout=self._timeout)
+        results: dict = {}
+        for forward in self._forwards:
+            try:
+                results[forward.purpose] = verifier.check_forward(
+                    forward, timeout=self._timeout
+                ).to_dict()
+            except Exception as exc:  # noqa: BLE001 - one bad port must not lose the others
+                results[forward.purpose] = {
+                    "host": forward.host, "port": forward.port,
+                    "reachability": "refused", "latency_ms": 0.0,
+                    "checked_at": 0.0, "cached": False,
+                    "detail": str(exc)[:200],
+                    "provenance": "unknown",
+                }
+        self.done.emit(results)
 
 
 class VMSwitcherPanel(QWidget):
@@ -35,6 +78,7 @@ class VMSwitcherPanel(QWidget):
         super().__init__(parent)
         self._manager = MultiVMManager()
         self._active_vm: str | None = None
+        self._reach_worker: "_ReachabilityWorker | None" = None
         self.setStyleSheet("background: " + T.BG_PRIMARY + ";")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
@@ -255,6 +299,55 @@ class VMSwitcherPanel(QWidget):
 
         limits_card.content_layout.addLayout(limits_grid)
 
+        # ── Network Reachability ─────────────────────────────────────────────────
+        # The ports below are *modelled* from config: nothing has connected to
+        # them, so every row starts as "not checked". Only a real TCP connect
+        # turns one into reachable/unreachable, and those runs on a worker thread
+        # because each one can sit for the whole timeout.
+        net_card = Card("Network Reachability")
+        layout.addWidget(net_card)
+
+        net_grid = QGridLayout()
+        net_grid.setSpacing(8)
+        net_grid.setContentsMargins(0, 0, 0, 0)
+        net_grid.setColumnStretch(1, 1)
+
+        self._net_port_labels: dict[str, QLabel] = {}
+        for row, (key, caption) in enumerate((("qmp", "QMP"), ("ssh", "SSH"))):
+            lbl = QLabel(caption)
+            lbl.setStyleSheet(f"color: {T.TEXT_MUTED}; font-size: 11px;")
+            net_grid.addWidget(lbl, row, 0)
+            val = QLabel("—")
+            val.setStyleSheet(f"color: {T.TEXT_MUTED}; font-size: 12px;")
+            net_grid.addWidget(val, row, 1)
+            self._net_port_labels[key] = val
+
+        check_btn = QPushButton("Check Reachability")
+        check_btn.setFixedHeight(28)
+        check_btn.setCursor(Qt.PointingHandCursor)
+        check_btn.setToolTip(
+            "Connect to this VM's QMP and SSH ports and report what answered"
+        )
+        check_btn.setStyleSheet(
+            f"QPushButton {{ background: {T.BG_SECONDARY}; color: {T.TEXT_SECONDARY};"
+            f" border: 1px solid {T.BG_TERTIARY}; border-radius: 4px; font-size: 11px; }}"
+            f"QPushButton:hover {{ color: {T.TEXT_PRIMARY}; }}"
+        )
+        check_btn.clicked.connect(self._check_reachability)
+        net_grid.addWidget(check_btn, 2, 0, 1, 2)
+        self._net_check_btn = check_btn
+
+        self._net_limitation = QLabel("")
+        self._net_limitation.setWordWrap(True)
+        self._net_limitation.setStyleSheet(
+            f"color: {T.WARNING}; font-size: 11px; padding: 6px 10px;"
+            f" border-radius: 4px; background: {T.WARNING_BG};"
+        )
+        self._net_limitation.hide()
+
+        net_card.content_layout.addLayout(net_grid)
+        net_card.content_layout.addWidget(self._net_limitation)
+
         # ── Status ─────────────────────────────────────────────────────────────
         self._status = QLabel("No VM selected")
         self._status.setStyleSheet(f"color: {T.TEXT_MUTED}; font-size: 11px;")
@@ -265,6 +358,7 @@ class VMSwitcherPanel(QWidget):
         self._timer.timeout.connect(self.refresh)
         self._timer.start(5000)
 
+        self._show_host_limitation()
         self.refresh()
 
     def refresh(self) -> None:
@@ -343,6 +437,9 @@ class VMSwitcherPanel(QWidget):
             )
             self._detail_qmp.setText(self._manager.get_qmp_uri(name) or "—")
             self._detail_ssh.setText(self._manager.get_ssh_uri(name) or "—")
+            # The reachability rows describe whichever VM is selected, so showing
+            # the previous VM's results under a new name would misattribute them.
+            self._reset_reachability_rows()
             self._detail_ram.setText(f"{config.ram_mb} MB (max: {config.resource_limits.max_ram_mb} MB)")
             self._detail_cpus.setText(f"{config.cpus} (max: {config.resource_limits.max_cpus})")
 
@@ -350,6 +447,136 @@ class VMSwitcherPanel(QWidget):
             self._ram_spin.setValue(config.resource_limits.max_ram_mb)
             self._cpu_spin.setValue(config.resource_limits.max_cpus)
             self._prio_spin.setValue(config.resource_limits.priority)
+
+    def _show_host_limitation(self) -> None:
+        """Show what this host cannot do at the network layer, once, at start-up.
+
+        Asked rather than hardcoded: the reason is host-dependent, and a machine
+        with different capabilities should not be told it cannot bridge.
+        """
+        try:
+            from vm_harness.cluster import layer2_capability
+
+            can_l2, reason = layer2_capability()
+        except Exception:  # noqa: BLE001 - a probe failure must not break the panel
+            return
+        if not can_l2:
+            self._show_l2_limitation(reason)
+
+    # ── Reachability ─────────────────────────────────────────────────────────
+
+    def _selected_forwards(self) -> list:
+        """The selected VM's port forwards, modelled from its config.
+
+        Returns [] when nothing is selected or the config has no ports. The
+        forwards are inferred, never observed -- only :meth:`_check_reachability`
+        can promote them, and until then the rows say so.
+        """
+        name = self._get_selected_name()
+        if not name:
+            return []
+        config = self._manager.get_vm(name)
+        if config is None:
+            return []
+        from vm_harness.cluster import vm_forwards
+
+        qmp = vm_forwards(
+            name,
+            qmp_port=int(getattr(config, "qmp_port", 0) or 0),
+            host=str(getattr(config, "qmp_host", "127.0.0.1") or "127.0.0.1"),
+        )
+        # The SSH forward lives on its own host in the config; reusing the QMP host
+        # would probe the wrong machine whenever the two differ.
+        ssh = vm_forwards(
+            name,
+            ssh_port=int(getattr(config, "ssh_port", 0) or 0),
+            host=str(getattr(config, "ssh_host", "127.0.0.1") or "127.0.0.1"),
+        )
+        return qmp + ssh
+
+    def _check_reachability(self) -> None:
+        """Connect to the selected VM's forwards and report each answer.
+
+        Deliberately asynchronous. A probe that cannot be reached holds its socket
+        for the whole timeout, and doing that on the Qt thread freezes the window
+        for every other panel as well -- so the connects run on a worker thread and
+        the results come back through a queued signal.
+
+        The three outcomes stay distinct in the UI: `refused` means the host
+        answered no (nothing listening), `timeout` means nothing answered at all.
+        They have different causes and the user needs to see which one happened.
+        """
+        name = self._get_selected_name()
+        forwards = self._selected_forwards()
+        if not name:
+            QMessageBox.warning(self, "Warning", "Select a VM first")
+            return
+        if not forwards:
+            for label in self._net_port_labels.values():
+                label.setText("no forward configured")
+            return
+
+        self._net_check_btn.setEnabled(False)
+        for label in self._net_port_labels.values():
+            label.setText("checking…")
+            label.setStyleSheet(f"color: {T.TEXT_MUTED}; font-size: 12px;")
+
+        worker = _ReachabilityWorker(self, list(forwards))
+        self._reach_worker = worker
+        worker.done.connect(self._on_reachability_done)
+        worker.finished.connect(lambda: setattr(self, "_reach_worker", None))
+        worker.start()
+
+    def _on_reachability_done(self, results: dict) -> None:
+        """Render probe results.
+
+        ``results`` maps a port name to the probe's dict. A port with no entry was
+        not probed, which is shown as `not checked` rather than left blank: an empty
+        row and an unchecked row are not the same claim.
+        """
+        self._net_check_btn.setEnabled(True)
+        colors = {
+            "reachable": T.SUCCESS,
+            "refused": T.ERROR,
+            "timeout": T.WARNING,
+        }
+        for key, label in self._net_port_labels.items():
+            result = results.get(key)
+            if result is None:
+                label.setText("not checked")
+                label.setStyleSheet(f"color: {T.TEXT_MUTED}; font-size: 12px;")
+                continue
+            state = result["reachability"]
+            if state == "reachable":
+                text = f"{result['host']}:{result['port']} — reachable ({result['latency_ms']:.0f} ms)"
+            else:
+                text = f"{result['host']}:{result['port']} — {state}: {result['detail']}"
+            label.setText(text)
+            label.setStyleSheet(f"color: {colors.get(state, T.TEXT_MUTED)}; font-size: 12px;")
+        self._status.setText("Reachability checked (measured, not inferred)")
+
+    def _show_l2_limitation(self, reason: str) -> None:
+        """State the layer-2 impossibility in the panel that suggests topology.
+
+        Better here than in a log nobody reads: the reason a container and a VM
+        cannot share a segment on this host is structural, and finding that out
+        before building the topology is the whole point.
+        """
+        if not reason:
+            self._net_limitation.hide()
+            return
+        self._net_limitation.setText(f"⚠️ {reason}")
+        self._net_limitation.show()
+
+    def _reset_reachability_rows(self) -> None:
+        """Put the reachability rows back to "not checked".
+
+        A stale result is worse than none: it reads as a fact about the selected VM
+        when it is really a fact about whichever VM was selected a minute ago.
+        """
+        for label in self._net_port_labels.values():
+            label.setText("not checked")
+            label.setStyleSheet(f"color: {T.TEXT_MUTED}; font-size: 12px;")
 
     def _clear_details(self):
         """Clear detail panel."""
