@@ -395,6 +395,39 @@ SUPPORTED_ENCODINGS: tuple[int, ...] = (
     ENCODING_COPY_RECT,
     ENCODING_RAW,
 )
+
+#: What is actually offered to a server in SetEncodings, in preference order.
+#:
+#: Deliberately *not* the same as :data:`SUPPORTED_ENCODINGS`. Tight is decodable
+#: and stays in that set, so a rectangle that arrives as Tight still renders; it
+#: is simply not advertised to QEMU, whose Tight framing this decoder cannot be
+#: made to agree with. Measured against QEMU 11.1 with a 1280x800,
+#: 32-bpp/depth-24 client format:
+#:
+#: * a Tight rectangle whose control byte has bit 7 set carries **two** bytes of
+#:   pixel data, where the specification says a TPIXEL there is three (three is
+#:   correct for depth 24), and the following bytes only parse as a rectangle
+#:   header under the two-byte reading;
+#: * other rectangles carry control bytes of 0x60, whose compression field reads
+#:   as 2 -- PNG -- where the following bytes are a zlib stream.
+#:
+#: Both readings are self-consistent enough to be tempting and both desynchronise
+#: the stream within a few rectangles, and RFB has no resynchronisation: once the
+#: byte offsets are wrong, every later rectangle is garbage and the session has to
+#: be torn down. So QEMU is offered Hextile instead, which is implemented, tested
+#: against real bytes, and is what most VNC clients end up using anyway.
+#:
+#: This costs bandwidth on large repaints, not correctness or the property that
+#: matters here: QEMU still decides what changed and still sends only the damaged
+#: regions. Remove Tight from this tuple once QEMU's framing is understood --
+#: :func:`_decode_tight` is the only thing standing in the way.
+ADVERTISED_ENCODINGS: tuple[int, ...] = (
+    ENCODING_HEXTILE,
+    ENCODING_RRE,
+    ENCODING_COPY_RECT,
+    ENCODING_RAW,
+)
+
 #: Sent after the real encodings so the server has it to hand even if it
 #: ignores everything else.
 PSEUDO_DESKTOP_SIZE = ENCODING_DESKTOP_SIZE
@@ -520,6 +553,25 @@ def encode_key_event(down: bool, keysym: int) -> bytes:
     if not 0 <= keysym <= 0xFFFF:
         raise ProtocolError(f"keysym 0x{keysym:x} does not fit in u32")
     return struct.pack(">BBxxI", CLIENT_KEY_EVENT, 1 if down else 0, keysym)
+
+
+def encode_client_init(shared: bool = True) -> bytes:
+    """ClientInit: one byte, and the ordering question this whole function exists for.
+
+    RFB says the server sends ServerInit immediately after SecurityResult and
+    the client answers with this. QEMU's VNC server does the opposite: measured
+    against QEMU 11.1, it sends nothing after SecurityResult until it has read
+    ClientInit, and only then the desktop name and size. A client that waits for
+    ServerInit before sending ClientInit therefore waits for ever -- a handshake
+    that neither side times out or errors, which is exactly what a dead console
+    looks like.
+
+    Sending it early is safe against a server that follows the spec: the byte is
+    the same byte, on the same stream, and a server expecting it after ServerInit
+    reads it from the stream either way. There is no ordering a standard server
+    can be broken by, because ClientInit never travels in the other direction.
+    """
+    return bytes((1 if shared else 0,))
 
 
 def encode_client_cut_text(text: str) -> bytes:
@@ -1081,14 +1133,27 @@ async def _read_tight_compact_length(source: "AsyncByteReader") -> int:
 async def _decode_tight(fb: Framebuffer, rect: Rectangle, fmt: PixelFormat, source: "AsyncByteReader") -> None:
     """Tight: zlib over TPIXELs, with a filter implied by the control byte.
 
-    Only BasicCompression with zlib and the CopyFilter are accepted, which is
-    what the specification requires every implementation to decode and what the
-    server sends. JPEG and PNG compression types, and the Gradient filter, are
-    refused rather than guessed at.
+    Three of Tight's four shapes are decoded:
+
+    * FillCompression -- one TPIXEL covering the whole rectangle;
+    * BasicCompression with zlib and the CopyFilter or an explicit filter id;
+    * the control byte's filter bit clear, which means CopyFilter.
+
+    JPEG and PNG compression and the Gradient and Palette filters are refused
+    rather than guessed at. Refusing is a session-ending error here, which is
+    why FillCompression is implemented rather than refused: QEMU's VNC server
+    sends it, for every solid rectangle it draws, and treating it as an
+    undecodable encoding ended the session on the first frame -- a cursor
+    trail or a cleared menu was enough to kill the console.
     """
     control = await source.read_u8()
     if control & 0x80:
-        raise UnsupportedEncoding("Tight FillCompression is not supported")
+        # FillCompression: no compression id, no filter byte, no zlib stream --
+        # just one TPIXEL that covers the entire rectangle. Everything else in
+        # the control byte is ignored, per the specification.
+        tpixel_size = _tight_tpixel_size(fmt)
+        _fill_tight_pixel(fb, rect, fmt, await source.read_exactly(tpixel_size))
+        return
     compression = (control >> 4) & 0x03
     if compression != 0:
         names = {1: "JPEG", 2: "PNG", 3: "ZRLE/Tight"}
@@ -1118,15 +1183,23 @@ async def _decode_tight(fb: Framebuffer, rect: Rectangle, fmt: PixelFormat, sour
 
 
 def _inflate(payload: bytes) -> bytes:
-    """Inflate a Tight zlib stream, refusing to expand without bound."""
-    decompressor = zlib.decompressobj()
+    """Inflate a Tight payload, refusing to expand without bound.
+
+    Tight's BasicCompression is **raw DEFLATE** (RFC 1951), not a zlib-wrapped
+    stream: there is no two-byte header and no Adler-32 trailer. That distinction
+    is invisible until it is fatal -- QEMU's VNC server sends raw deflate, so a
+    decoder using zlib's default framing fails with "incorrect header check" on
+    the first Tight rectangle it inflates, which on a live session reads as a
+    corrupt stream rather than as the wrong framing.
+    """
+    decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
     try:
         raw = decompressor.decompress(payload, MAX_TIGHT_DECOMPRESSED_BYTES)
     except zlib.error as exc:
-        raise ProtocolError(f"Tight zlib stream is corrupt: {exc}") from exc
+        raise ProtocolError(f"Tight DEFLATE stream is corrupt: {exc}") from exc
     if decompressor.unconsumed_tail:
         raise ProtocolError(
-            f"Tight zlib stream expands past the {MAX_TIGHT_DECOMPRESSED_BYTES} byte limit"
+            f"Tight DEFLATE stream expands past the {MAX_TIGHT_DECOMPRESSED_BYTES} byte limit"
         )
     return raw
 
@@ -1146,6 +1219,35 @@ def _tight_tpixel_size(fmt: PixelFormat) -> int:
     if fmt.depth > 8 and fmt.bits_per_pixel > 16:
         return 3
     return fmt.bytes_per_pixel
+
+
+def _fill_tight_pixel(fb: Framebuffer, rect: Rectangle, fmt: PixelFormat, pixel: bytes) -> None:
+    """Fill a rectangle with the single TPIXEL a FillCompression rectangle carries.
+
+    A TPIXEL is three RGB bytes for colour that needs more than 16 bits and a
+    whole PIXEL otherwise, exactly as in the non-filled case; the difference is
+    only that there is one of them and it covers the whole rectangle.
+
+    The 3-byte form is already BGR-ordered for us. The whole-PIXEL form is not:
+    it is a PIXEL in the *server's* format, so it goes through the same
+    conversion the Raw path uses -- via a one-pixel blit, which is also how the
+    colour gets validated. Filling with the raw bytes instead would put a 555
+    value straight into a BGRA framebuffer and paint the wrong colour.
+    """
+    if len(pixel) == 3:
+        r, g, b = pixel
+        fb.fill_rect(rect.x, rect.y, rect.width, rect.height, bytes((b, g, r, 0xFF)))
+        return
+    if len(pixel) != fmt.bytes_per_pixel:
+        raise ProtocolError(
+            f"Tight fill pixel is {len(pixel)} bytes, expected "
+            f"{3 if _tight_tpixel_size(fmt) == 3 else fmt.bytes_per_pixel}"
+        )
+    _blit_raw(fb, rect.x, rect.y, 1, 1, pixel, fmt)
+    start = (rect.y * fb.width + rect.x) * 4
+    fb.fill_rect(
+        rect.x, rect.y, rect.width, rect.height, bytes(fb.data[start:start + 4])
+    )
 
 
 def _decode_tight_pixels(fb: Framebuffer, rect: Rectangle, fmt: PixelFormat, raw: bytes) -> None:

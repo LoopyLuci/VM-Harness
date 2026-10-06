@@ -45,6 +45,7 @@ from typing import Awaitable, Callable, Optional, Sequence, Union
 from loguru import logger
 
 from vm_harness.vnc.proto import (
+    ADVERTISED_ENCODINGS,
     AuthError,
     ENCODING_DESKTOP_SIZE,
     SUPPORTED_ENCODINGS,
@@ -75,6 +76,7 @@ from vm_harness.vnc.proto import (
     encode_key_event,
     encode_pointer_event,
     encode_security_choice,
+    encode_client_init,
     encode_set_encodings,
     encode_set_pixel_format,
     encode_version,
@@ -162,7 +164,10 @@ class VNCClient:
         *,
         password: Optional[str] = None,
         pixel_format: Optional[PixelFormat] = None,
-        encodings: Sequence[int] = SUPPORTED_ENCODINGS,
+        # What goes on the wire is what this client can actually decode, and it is
+        # deliberately narrower than the decoder's full repertoire: see
+        # ADVERTISED_ENCODINGS for why Tight is decoded but not offered.
+        encodings: Sequence[int] = ADVERTISED_ENCODINGS,
         handshake_timeout: float = DEFAULT_HANDSHAKE_TIMEOUT,
         max_message_bytes: int = DEFAULT_MAX_MESSAGE_BYTES,
         on_frame: Optional[FrameCallback] = None,
@@ -223,8 +228,20 @@ class VNCClient:
         await self._negotiate_version()
         security_type = await self._negotiate_security()
         await self._authenticate(security_type)
+        # ClientInit before ServerInit, not after.
+        #
+        # QEMU's VNC server sends SecurityResult and then waits: it does not
+        # write ServerInit until it has read ClientInit. Waiting for ServerInit
+        # first -- what the spec's order implies -- is a handshake in which
+        # neither side ever speaks again, so it looks exactly like a dead
+        # console. Verified against QEMU 11.1.
+        #
+        # A server that follows the spec is unaffected: it writes ServerInit
+        # when it gets there regardless, and reads this same byte from the
+        # stream. Nothing here depends on the two crossing in a particular
+        # direction, because ClientInit only ever travels client to server.
+        await self._write_now(encode_client_init(shared=True))
         server_init = await self._read_server_init()
-
         self.server_init = server_init
         self.desktop_name = server_init.name
         self.framebuffer = Framebuffer(server_init.width, server_init.height)
@@ -351,6 +368,17 @@ class VNCClient:
                 f"(wanted {count} bytes, got {len(exc.partial)})"
             ) from exc
 
+    async def _write_now(self, payload: bytes) -> None:
+        """Write handshake bytes straight out.
+
+        During the handshake there is no receive loop to batch through, so the
+        outbox is bypassed: a handshake message that sits in a buffer waiting for
+        a loop that has not started yet is a handshake that never completes.
+        """
+        assert self._writer is not None
+        self._writer.write(payload)
+        await self._writer.drain()
+
     # ── Receive loop ──────────────────────────────────────────────────────────
 
     async def serve(self, frame_interval: float = DEFAULT_FRAME_REQUEST_INTERVAL) -> None:
@@ -366,6 +394,15 @@ class VNCClient:
         while not self._stop:
             await self.request_update(incremental=not self._needs_full_refresh)
             self._needs_full_refresh = False
+            # The request must be on the wire *before* the wait, not after it.
+            # An RFB server only ever sends an update in answer to a
+            # FramebufferUpdateRequest, and pump() below blocks until it sends
+            # one -- so flushing on the way out meant the first request sat in
+            # the outbox for ever, an idle guest never answered it, and the
+            # client sat waiting for a message that could not come. Nothing
+            # timed out and nothing was logged: a console that connects and then
+            # never shows a frame.
+            await self._flush_outbox()
             await asyncio.sleep(interval)
             try:
                 await self.pump()
@@ -376,6 +413,8 @@ class VNCClient:
                 if self._stop:
                     break
                 raise
+            # Anything queued while the receive was in flight -- a keystroke, a
+            # pointer move -- goes out now rather than at the next tick.
             await self._flush_outbox()
 
     async def pump(self) -> int:

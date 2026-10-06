@@ -69,6 +69,18 @@ from vm_harness.vnc.proto import (
 # ── Message builders ──────────────────────────────────────────────────────────
 
 
+def _raw_deflate(raw: bytes) -> bytes:
+    """Tight's compression: raw DEFLATE, with no zlib header or Adler-32 trailer.
+
+    Not ``zlib.compress``. Tight uses RFC 1951 framing, so a test that builds
+    payloads the zlib way passes a decoder that expects the zlib framing and
+    fails against QEMU, which does not. Found live against QEMU 11.1:
+    "incorrect header check" on the first Tight rectangle.
+    """
+    compressor = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+    return compressor.compress(raw) + compressor.flush()
+
+
 def rect_header(x: int, y: int, w: int, h: int, encoding: int) -> bytes:
     return struct.pack(">HHHHi", x, y, w, h, encoding)
 
@@ -133,6 +145,7 @@ class FakeRFBServer:
         password: str | None = None,
         security_result: bytes | None = None,
         send_server_init: bool = True,
+        serve_server_init_on_client_init: bool = False,
         stall_before_banner: bool = False,
         stall_after_banner: bool = False,
         close_after_banner: bool = False,
@@ -148,6 +161,11 @@ class FakeRFBServer:
         self.password = password
         self.security_result = security_result
         self.send_server_init = send_server_init
+        #: QEMU's ordering: SecurityResult, then nothing at all until the
+        #: client's ClientInit, and only then ServerInit. Off by default so the
+        #: other tests keep the spec order; on where the point is to survive a
+        #: server that behaves like QEMU.
+        self.serve_server_init_on_client_init = serve_server_init_on_client_init
         self.stall_before_banner = stall_before_banner
         self.stall_after_banner = stall_after_banner
         self.close_after_banner = close_after_banner
@@ -160,6 +178,8 @@ class FakeRFBServer:
         self.auth_response: bytes | None = None
         self.connection_closed = asyncio.Event()
         self.handshake_completed = asyncio.Event()
+        #: Only set in the QEMU-ordering mode, where the client has to speak first.
+        self.saw_client_init = False
 
         self._server: asyncio.AbstractServer | None = None
         self._outbox: asyncio.Queue = asyncio.Queue()
@@ -213,7 +233,7 @@ class FakeRFBServer:
         something it just asked for.
         """
         expected = 12 + 1 + len(
-            encode_set_encodings((*proto.SUPPORTED_ENCODINGS, ENCODING_DESKTOP_SIZE))
+            encode_set_encodings((*proto.ADVERTISED_ENCODINGS, ENCODING_DESKTOP_SIZE))
         )
         await self.wait_for_client(expected, timeout)
 
@@ -291,23 +311,21 @@ class FakeRFBServer:
             writer.write(struct.pack(">I", 0))
             await writer.drain()
 
-        if self.send_server_init:
-            name = self.name.encode("latin-1")
-            declared = len(name) if self.name_length_override is None else self.name_length_override
-            raw_format = (
-                self.pixel_format
-                if isinstance(self.pixel_format, (bytes, bytearray))
-                else self.pixel_format.encode()
-            )
-            writer.write(
-                struct.pack(">HH", self.width, self.height)
-                + raw_format
-                + struct.pack(">I", declared)
-                + name
-                + self.extra_init
-            )
-            await writer.drain()
+        if self.send_server_init and not self.serve_server_init_on_client_init:
+            await self._send_server_init(writer)
         self.handshake_completed.set()
+
+        if self.send_server_init and self.serve_server_init_on_client_init:
+            # QEMU's ordering: read ClientInit, and only then write ServerInit.
+            # Before the drainer starts, because the drainer would otherwise
+            # consume the byte this is waiting for.
+            try:
+                self.client_bytes += await reader.readexactly(1)
+                self.saw_client_init = True
+            except (asyncio.IncompleteReadError, ConnectionResetError):
+                return
+            await self._send_server_init(writer)
+            self.handshake_completed.set()
 
         # Everything the client sends after the handshake -- SetEncodings,
         # FramebufferUpdateRequests, PointerEvents, KeyEvents -- has to be read
@@ -322,6 +340,23 @@ class FakeRFBServer:
             writer.write(item)
             await writer.drain()
 
+    async def _send_server_init(self, writer: asyncio.StreamWriter) -> None:
+        name = self.name.encode("latin-1")
+        declared = len(name) if self.name_length_override is None else self.name_length_override
+        raw_format = (
+            self.pixel_format
+            if isinstance(self.pixel_format, (bytes, bytearray))
+            else self.pixel_format.encode()
+        )
+        writer.write(
+            struct.pack(">HH", self.width, self.height)
+            + raw_format
+            + struct.pack(">I", declared)
+            + name
+            + self.extra_init
+        )
+        await writer.drain()
+
     async def _drain(self, reader: asyncio.StreamReader) -> None:
         """Keep reading client bytes until the connection ends."""
         try:
@@ -334,6 +369,24 @@ class FakeRFBServer:
             return
         except Exception:  # pragma: no cover - the connection is going away
             return
+
+
+def _set_encodings_payload(client_bytes: bytes) -> bytes:
+    """The bytes of the client's SetEncodings message, found by scanning.
+
+    Parsed rather than sliced at a fixed offset, because the handshake has grown
+    a message: ClientInit now precedes it (see :func:`encode_client_init`), and a
+    test that hard-codes "the version reply and the security choice are 13 bytes"
+    breaks silently when anything else moves.
+    """
+    for index, value in enumerate(client_bytes):
+        if value != 2 or index + 2 > len(client_bytes):
+            continue
+        count = struct.unpack(">H", client_bytes[index + 2:index + 4])[0]
+        total = 4 + 4 * count
+        if index + total <= len(client_bytes) and client_bytes[index + 1] == 0:
+            return client_bytes[index:index + total]
+    raise AssertionError(f"no SetEncodings message in {len(client_bytes)} client bytes")
 
 
 async def connected_client(server: FakeRFBServer, **kwargs) -> VNCClient:
@@ -754,7 +807,7 @@ class TestTight:
         decoder resets the zlib stream. Then the one-to-three byte compact
         length, then a complete zlib stream.
         """
-        compressed = zlib.compress(raw)
+        compressed = _raw_deflate(raw)
         if len(compressed) <= 127:
             length = bytes((len(compressed),))
         elif len(compressed) <= 16383:
@@ -809,9 +862,39 @@ class TestTight:
         assert bgra_at(fb, 0, 0) == (255, 0, 0)
         assert bgra_at(fb, 1, 0) == (0, 255, 0)
 
-    async def test_fill_compression_is_refused(self):
+    async def test_fill_compression_covers_the_whole_rectangle(self):
+        """One TPIXEL, the whole rectangle.
+
+        Implemented rather than refused because QEMU's VNC server sends
+        FillCompression for every solid rectangle it draws, and a refusal ends
+        the session: a cleared menu or a cursor trail was enough to kill the
+        console on the first frame. Found live against QEMU 11.1.
+        """
+        fb = Framebuffer(4, 4)
+        await decode_rect(
+            fb, rect_header(1, 1, 2, 2, ENCODING_TIGHT) + b"\x80" + bytes((9, 8, 7))
+        )
+        assert bgra_at(fb, 1, 1) == (9, 8, 7)
+        assert bgra_at(fb, 2, 1) == (9, 8, 7)
+        assert bgra_at(fb, 1, 2) == (9, 8, 7)
+        assert bgra_at(fb, 2, 2) == (9, 8, 7)
+        # Nothing outside the rectangle moved.
+        assert bgra_at(fb, 0, 0) == (0, 0, 0)
+        assert bgra_at(fb, 3, 3) == (0, 0, 0)
+
+    async def test_fill_compression_uses_a_whole_pixel_for_16_bit_formats(self):
+        """A 16-bit format's TPIXEL is two bytes, not an RGB triple."""
         fb = Framebuffer(2, 2)
-        with pytest.raises(UnsupportedEncoding):
+        value = struct.pack("<H", 31 << 10)
+        await decode_rect(
+            fb, rect_header(0, 0, 2, 2, ENCODING_TIGHT) + b"\x80" + value, RGB555
+        )
+        assert bgra_at(fb, 0, 0) == (255, 0, 0)
+        assert bgra_at(fb, 1, 1) == (255, 0, 0)
+
+    async def test_a_truncated_fill_is_an_error_not_a_wrong_colour(self):
+        fb = Framebuffer(2, 2)
+        with pytest.raises(ProtocolError):
             await decode_rect(fb, rect_header(0, 0, 2, 2, ENCODING_TIGHT) + b"\x81\x00")
 
     async def test_jpeg_and_png_compression_are_refused(self):
@@ -830,7 +913,7 @@ class TestTight:
     async def test_explicit_copy_filter_byte_is_accepted(self):
         fb = Framebuffer(2, 2)
         raw = b"".join(bytes((1, 2, 3)) for _ in range(4))
-        compressed = zlib.compress(raw)
+        compressed = _raw_deflate(raw)
         payload = b"\x41\x00" + bytes((len(compressed),)) + compressed
         await decode_rect(fb, rect_header(0, 0, 2, 2, ENCODING_TIGHT) + payload)
         assert bgra_at(fb, 0, 0) == (1, 2, 3)
@@ -838,7 +921,7 @@ class TestTight:
     async def test_a_decompression_bomb_is_refused(self):
         fb = Framebuffer(64, 64)
         # A tiny stream that inflates to far more than a rectangle can hold.
-        bomb = zlib.compress(b"\x00" * (64 * 64 * 4 * 40))
+        bomb = _raw_deflate(b"\x00" * (64 * 64 * 4 * 40))
         payload = b"\x01" + bytes((len(bomb) & 0x7F,)) + bomb if len(bomb) < 128 else b"\x01" + bytes(
             (0x80 | (len(bomb) & 0x7F), (len(bomb) >> 7) & 0x7F)
         ) + bomb
@@ -868,10 +951,10 @@ class TestUnknownEncoding:
         assert "16" in str(excinfo.value)
 
     async def test_set_encodings_lists_only_what_can_be_decoded(self):
-        payload = encode_set_encodings(proto.SUPPORTED_ENCODINGS)
+        payload = encode_set_encodings(proto.ADVERTISED_ENCODINGS)
         assert payload[0] == 2  # client-to-server SetEncodings
         count = struct.unpack(">H", payload[2:4])[0]
-        assert count == len(proto.SUPPORTED_ENCODINGS)
+        assert count == len(proto.ADVERTISED_ENCODINGS)
         listed = [struct.unpack(">i", payload[4 + i * 4:8 + i * 4])[0] for i in range(count)]
         assert listed == [7, 5, 2, 1, 0]
         assert ENCODING_DESKTOP_SIZE not in listed  # sent separately
@@ -1034,11 +1117,38 @@ class TestDesktopSize:
         try:
             client = await connected_client(server)
             await server.wait_for_handshake_messages()
-            payload = bytes(server.client_bytes[13:])
+            # Locate the SetEncodings message rather than assuming an offset:
+            # ClientInit now sits between the security choice and it, because
+            # QEMU's VNC server will not send ServerInit until it has read
+            # ClientInit, so the client has to send it before it can read the
+            # desktop at all. See encode_client_init.
+            payload = _set_encodings_payload(bytes(server.client_bytes))
             assert ENCODING_DESKTOP_SIZE in [
                 struct.unpack(">i", payload[4 + i * 4:8 + i * 4])[0]
                 for i in range(struct.unpack(">H", payload[2:4])[0])
             ]
+            await client.close()
+        finally:
+            await server.stop()
+
+    async def test_client_init_is_sent_before_server_init_is_read(self):
+        """QEMU's VNC server sends ServerInit only after it has read ClientInit.
+
+        A client that waits for ServerInit before sending ClientInit -- the
+        order the RFB spec implies -- deadlocks with no error and no timeout:
+        both sides are waiting for the other. That is indistinguishable from a
+        dead console, which is how it was found: against QEMU 11.1 the
+        handshake produced a security result and then silence.
+        """
+        server = await FakeRFBServer(serve_server_init_on_client_init=True).start()
+        try:
+            client = await connected_client(server, handshake_timeout=3.0)
+            assert client.framebuffer is not None
+            assert client.framebuffer.width == 64
+            # ClientInit is one byte -- the shared flag, with no message type --
+            # so what is asserted is that the server received it at all.
+            assert server.saw_client_init, "the server never got its ClientInit"
+            assert bytes(server.client_bytes).endswith(b"\x01"), "ClientInit was not shared"
             await client.close()
         finally:
             await server.stop()
@@ -1200,6 +1310,35 @@ class TestServeLoop:
         client = VNCClient("127.0.0.1", 5900)
         with pytest.raises(RuntimeError):
             await client.serve()
+
+    async def test_the_first_update_request_is_sent_before_waiting_for_a_reply(self):
+        """A server only answers a request, so the request has to come first.
+
+        Flushing the outbox after the blocking read instead meant the very first
+        FramebufferUpdateRequest sat unsent until the server spoke -- which,
+        for a server that waits to be asked, is for ever. The session connected
+        cleanly and then never received a frame, with no error anywhere. That is
+        why a capture source driving this loop needs the request on the wire
+        before the wait rather than after it.
+        """
+        server = await FakeRFBServer(width=16, height=16).start()
+        try:
+            client = await connected_client(server)
+            serving = asyncio.ensure_future(client.serve(frame_interval=0.005))
+            # No reply is ever sent, so only the ordering can satisfy this.
+            for _ in range(200):
+                if b"\x03" in bytes(server.client_bytes):
+                    break
+                await asyncio.sleep(0.005)
+            client.stop()
+            serving.cancel()
+            await asyncio.gather(serving, return_exceptions=True)
+            assert b"\x03\x01" in bytes(server.client_bytes), (
+                "the update request never reached the wire"
+            )
+            await client.close()
+        finally:
+            await server.stop()
 
     async def test_stop_ends_the_loop(self):
         server = await FakeRFBServer(width=16, height=16).start()

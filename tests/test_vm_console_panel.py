@@ -195,6 +195,62 @@ def _go_live(
     return socket
 
 
+# ── Capture source ─────────────────────────────────────────────────────────────
+
+
+def test_the_capture_source_combo_offers_both_transports(qtbot, panel):
+    """Both, plus auto: the setting is useless if it cannot express the fallback."""
+    labels = [panel._capture_combo.itemText(i) for i in range(panel._capture_combo.count())]
+    assert len(labels) == 3
+    for label, value in (("VNC (fast, damage-only)", "vnc"),
+                         ("QMP screendump (any VM)", "screendump"),
+                         ("Auto (VNC when available)", "auto")):
+        panel._capture_combo.setCurrentText(label)
+        assert panel.selected_capture_source() == value
+    panel.close()
+
+
+def test_the_capture_source_defaults_to_auto(qtbot, panel):
+    """Auto rather than vnc: a VM without a VNC display must still stream."""
+    assert panel.selected_capture_source() == "auto"
+    panel.close()
+
+
+def test_the_capture_source_goes_on_the_wire(qtbot, panel):
+    socket = _go_live(qtbot, panel)
+    socket.sent.clear()
+
+    panel._capture_combo.setCurrentText("VNC (fast, damage-only)")
+    _pump(qtbot, 400)
+
+    assert socket.of_type("config")[-1]["capture_source"] == "vnc"
+    panel.close()
+
+
+def test_changing_the_capture_source_is_shown_in_the_pending_ack(qtbot, panel):
+    socket = _go_live(qtbot, panel)
+    panel._capture_combo.setCurrentText("QMP screendump (any VM)")
+    panel._send_config()
+    _pump(qtbot, 20)
+    assert "capture screendump" in panel._ack_label.text()
+    panel.close()
+
+
+def test_a_settings_file_with_an_unknown_capture_source_still_loads(qtbot, panel, tmp_path):
+    """A file written by a build that knew other transports is not a crash."""
+    from gui.settings_schema import save_settings
+
+    save_settings(
+        {"_schema_version": 1,
+         "vm_console": {"bridge_url": BRIDGE_PYTHON_URL, "capture_source": "spice"}},
+        str(tmp_path / "settings.json"),
+    )
+    panel._settings_path = str(tmp_path / "settings.json")
+    panel._load_settings()
+    assert panel.selected_capture_source() == "auto"
+    panel.close()
+
+
 def _viewport_scene_rect(panel: VMConsolePanel) -> QRectF:
     view = panel._graphics_view
     rect = view.viewport().rect()
@@ -745,6 +801,7 @@ def test_after_auth_ok_the_config_and_subscribe_are_sent(qtbot, panel):
         "width": 1024,
         "height": 768,
         "input_enabled": True,
+        "capture_source": "auto",
     }
     assert socket.of_type("subscribe")[0] == {
         "type": "subscribe", "vm": "win11"
@@ -942,6 +999,7 @@ def test_settings_round_trip_through_settings_json(qtbot, panel, tmp_path):
     panel._quality_spin.setValue(60)
     panel._input_check.setChecked(False)
     panel._url_input.setText(BRIDGE_SIDECAR_URL)
+    panel._capture_combo.setCurrentText("QMP screendump (any VM)")
     panel._save_settings()
     _pump(qtbot, 20)
 
@@ -953,6 +1011,7 @@ def test_settings_round_trip_through_settings_json(qtbot, panel, tmp_path):
         "width": 1024,
         "height": 640,
         "input_enabled": False,
+        "capture_source": "screendump",
     }
 
     other = VMConsolePanel()
@@ -961,6 +1020,7 @@ def test_settings_round_trip_through_settings_json(qtbot, panel, tmp_path):
     assert other._url_input.text() == BRIDGE_SIDECAR_URL
     assert other._width_spin.value() == 1024
     assert other._input_check.isChecked() is False
+    assert other.selected_capture_source() == "screendump"
     other.close()
 
 

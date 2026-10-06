@@ -95,6 +95,21 @@ def _extra_args_declare_device(extra_args: list[Any], model: str) -> bool:
     return False
 
 
+def _extra_args_declare_vnc(extra_args: list[Any]) -> bool:
+    """True when the user already passes ``-vnc`` by hand through ``extra_args``.
+
+    Same reasoning as :func:`_extra_args_declare_device`, for the same reason:
+    two ``-vnc`` flags is a second display, not a second copy of the first.
+    """
+    for i, arg in enumerate(extra_args):
+        text = str(arg)
+        if text.startswith("-vnc="):
+            return True
+        if text == "-vnc":
+            return True
+    return False
+
+
 def input_device_args(config: dict[str, Any]) -> list[str]:
     """The input devices a VM is launched with: a USB tablet and an explicit keyboard.
 
@@ -1202,11 +1217,50 @@ class QEMUBackend(HypervisorBackend):
             args.extend(["-spice", ",".join(spice_args), "-display", "none"])
         elif display_type == "vnc":
             vnc_port = display_port or 5900
-            args.extend(["-vnc", f":{vnc_port - 5900}", "-display", "none"])
+            # Loopback only. This used to be "-vnc :<display>", which QEMU reads
+            # as *every* interface: an unauthenticated VNC server, with no
+            # password set anywhere on this path, reachable from the network.
+            # A display bound to 0.0.0.0 needs remote access to it to be useful,
+            # and nothing here provides that.
+            args.extend(["-vnc", f"127.0.0.1:{vnc_port - 5900}", "-display", "none"])
         elif display_type == "sdl":
             args.extend(["-display", "sdl"])
         elif display_type == "gtk":
             args.extend(["-display", "gtk"])
+
+        # A loopback VNC display for the streaming bridge to read frames from.
+        #
+        # Not the same thing as display_type == "vnc" above: that one is a
+        # display somebody asked to look at, this one exists so the capture
+        # source has something to read. It is added for every display type that
+        # has no VNC of its own, because without it the bridge can only screendump
+        # -- a QMP round trip, QEMU encoding the whole framebuffer as PNG, this
+        # process decoding it again, and no damage tracking at all. With it the
+        # bridge reads only the regions that changed.
+        #
+        # The port is derived from the VM's QMP port rather than allocated, so
+        # two VMs never collide and the bridge can work the endpoint out from
+        # the registry entry it already reads; see vm_harness.vnc.display for the
+        # scheme and for why the bind is loopback with no password.
+        if (
+            display_type != "vnc"
+            and config.get("vnc_capture", True)
+            and not _extra_args_declare_vnc(extra_args)
+        ):
+            # Imported here rather than at module scope: this is one function of
+            # a launcher module, and the vnc package pulls in the RFB client and
+            # its loguru dependency for two constants and one pure function.
+            from vm_harness.vnc.display import VncEndpointError, vnc_arg_for_qmp_port
+
+            qmp_port_base = config.get("qmp_port_base")
+            try:
+                base = int(qmp_port_base) if qmp_port_base else DEFAULT_QMP_PORT_BASE
+                args.extend(["-vnc", vnc_arg_for_qmp_port(int(qmp_port), base)])
+            except (VncEndpointError, TypeError, ValueError) as exc:
+                # A QMP port outside the reserved window. The VM still boots and
+                # is still controllable; it just has no RFB display, so the
+                # bridge captures it by screendump as it always did.
+                logger.warning("no RFB display for VM %s, capturing by screendump: %s", name, exc)
 
         # Input devices: an absolute pointing device (QMP abs events need one) and an
         # explicit keyboard. Without the tablet the remote pointer never moves.

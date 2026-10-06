@@ -10,10 +10,31 @@ that same VM.
 
     ws://127.0.0.1:8445/ws/stream
 
+Where the frames come from
+--------------------------
+Two capture sources, chosen per client in ``config.capture_source``:
+
+``vnc``
+    :class:`VncCaptureSource` reads QEMU's own VNC server over RFB. The server
+    tracks damage and pushes only what changed, so a frame costs one rectangle
+    transfer instead of a QMP round trip plus a full-framebuffer PNG encode and
+    decode. This is the default wherever the VM was launched with ``-vnc``.
+
+``screendump``
+    :class:`VMStreamSource` polls ``screendump`` over QMP. Always available,
+    40-70ms per frame on this host, and the fallback when a VM has no VNC
+    display -- so a VM launched by hand without ``-vnc`` still streams.
+
+The default is ``auto``: RFB where the VM has a display, screendump otherwise.
+Neither is a mode a user has to reason about, because a failed RFB connect
+hands straight over to the screendump loop rather than dropping anyone's
+picture.
+
 Wire protocol (text JSON in both directions, plus binary frames out)::
 
     client -> {"type":"config","vm":"win11","quality":80,"fps":30,
-               "width":1280,"height":800,"input_enabled":true}
+               "width":1280,"height":800,"input_enabled":true,
+               "capture_source":"auto"}
     client -> {"type":"subscribe","vm":"win11"}
     client -> {"type":"input","input_type":"key","key":"a","pressed":true}
     client -> {"type":"input","input_type":"mouse_move","x":640,"y":400}
@@ -128,6 +149,14 @@ from vm_harness.guest_input import (
     key_for,
 )
 from vm_harness.qmp_client import QMPClient
+from vm_harness.vnc import (
+    VNC_BIND_HOST,
+    VNCClient,
+    VncEndpointError,
+    parse_vnc_port,
+    vnc_port_for_qmp_port,
+)
+from vm_harness.vnc.proto import Framebuffer
 
 try:  # Pillow is only needed to transcode PNG -> JPEG; without it, capture fails.
     from PIL import Image
@@ -172,10 +201,12 @@ _MIN_PACING_WAIT_SEC = 0.005
 #: server busy. Raised from 60 to 120 so a fast link can be asked for more.
 #:
 #: Be clear about what this cap is and is not: it is a ceiling on what may be
-#: *requested*, not a promise of what is delivered. Capture is a QMP screendump
-#: -- a socket round trip, a PNG decode and a JPEG encode -- and on a running#: desktop that measured 40-70ms per frame here, so the practical ceiling is
-#: roughly 15-25fps regardless of this number. Reaching 30-60fps, let alone#: 120, needs a transport that streams continuously (VNC or SPICE) rather
-#: than being polled one whole frame at a time.
+#: *requested*, not a promise of what is delivered. Over the screendump source
+#: capture is a QMP round trip, a PNG decode and a JPEG encode, and on a running
+#: desktop that measured 40-70ms per frame here, so the practical ceiling is
+#: roughly 15-25fps regardless of this number. :class:`VncCaptureSource` is what
+#: removes that ceiling, by streaming QEMU's damage stream instead of asking for
+#: a whole frame at a time.
 MAX_FPS = 120
 DEFAULT_WIDTH = 1920
 DEFAULT_HEIGHT = 1080
@@ -197,6 +228,46 @@ SCREENDUMP_POLL_SEC = 0.05
 #: Suppresses the console window Windows would otherwise flash for every
 #: ``docker exec``. Only meaningful on Windows; ignored elsewhere.
 CREATE_NO_WINDOW = 0x08000000
+
+# ── Capture source ─────────────────────────────────────────────────────────────
+
+#: Where frames come from. ``auto`` means "use RFB if the VM has a VNC display,
+#: otherwise screendump", which is the default because RFB is the strictly
+#: better capture source and screendump is the one that always works.
+CAPTURE_SOURCE_AUTO = "auto"
+CAPTURE_SOURCE_VNC = "vnc"
+CAPTURE_SOURCE_SCREENDUMP = "screendump"
+CAPTURE_SOURCES = (CAPTURE_SOURCE_AUTO, CAPTURE_SOURCE_VNC, CAPTURE_SOURCE_SCREENDUMP)
+DEFAULT_CAPTURE_SOURCE = CAPTURE_SOURCE_AUTO
+CAPTURE_SOURCE_ENV = "VMHARNESS_CAPTURE_SOURCE"
+
+#: How often the RFB client asks "has anything changed?".
+#:
+#: This is a *latency* knob and not a capture-rate knob, which is the whole
+#: reason RFB beats a poll: the server answers only when it has damage, so the
+#: cost of asking often is a little idle CPU and the benefit is not waiting out
+#: a remainder before a change that already happened is noticed. 5ms is the floor
+#: ``VNCClient.serve`` clamps to, and it bounds the delay between the guest
+#: drawing something and the frame being published. It does *not* invent frames:
+#: a guest that redraws at 15fps still delivers 15fps.
+VNC_FRAME_REQUEST_INTERVAL = 0.005
+
+#: How long the framebuffer may go undamaged before the RFB source asks QMP
+#: whether the guest is merely idle or actually paused.
+#:
+#: Over RFB a paused guest is *silent* -- no error, no close, just no damage --
+#: so the screendump path's error-driven watchdog has nothing to fire on and the
+#: console would sit on a frozen picture forever. Same detection, different
+#: trigger.
+VNC_STALL_CHECK_INTERVAL = 2.0
+VNC_STALL_SEC = 6.0
+
+#: How long the RFB source stays on screendump after an RFB failure before it
+#: tries RFB again. Long enough that a VM with no VNC display costs exactly what
+#: it always cost (one screendump per tick, plus one refused connection per
+#: interval), and short enough that a VM that was relaunched with ``-vnc`` comes
+#: back onto the fast path without restarting the bridge.
+VNC_RETRY_INTERVAL = 30.0
 
 _LANCZOS = getattr(getattr(Image, "Resampling", Image), "LANCZOS", 1)
 
@@ -253,6 +324,20 @@ def _as_int(value: Any) -> Optional[int]:
     if isinstance(value, float) and value.is_integer():
         return int(value)
     return None
+
+
+def normalise_capture_source(value: Any, default: str = DEFAULT_CAPTURE_SOURCE) -> str:
+    """Coerce a requested capture source to one of :data:`CAPTURE_SOURCES`.
+
+    Anything unrecognised becomes ``default`` rather than an error. A client a
+    version ahead of the bridge must not lose its picture because it asked for a
+    transport this build has never heard of, and the server's own default is
+    always a working one.
+    """
+    if not isinstance(value, str):
+        return default
+    candidate = value.strip().lower()
+    return candidate if candidate in CAPTURE_SOURCES else default
 
 
 # ── Authentication ─────────────────────────────────────────────────────────────
@@ -313,10 +398,18 @@ class TokenAuthenticator:
 
 @dataclass(frozen=True)
 class VMTarget:
-    """One streamable VM: a name and the QMP endpoint that reaches it."""
+    """One streamable VM: a name, the QMP endpoint that reaches it, and the RFB
+    endpoint its framebuffer can be read from.
+
+    ``vnc_port`` is derived, not stored: see
+    :func:`vm_harness.vnc.display.vnc_port_for_qmp_port`. It is 0 when the VM has
+    no RFB display, which is not an error -- it is the signal to capture by
+    screendump instead.
+    """
     name: str
     qmp_uri: str
     password: str = ""
+    vnc_port: int = 0
 
 
 class VMRegistry:
@@ -394,7 +487,34 @@ class VMRegistry:
         host = data.get("management_host") or "127.0.0.1"
         if not isinstance(host, str) or not host:
             host = "127.0.0.1"
-        return VMTarget(name, f"tcp:{host}:{port}", password)
+        return VMTarget(name, f"tcp:{host}:{port}", password, self._vnc_port_for(data, port))
+
+    def _vnc_port_for(self, data: dict, qmp_port: int) -> int:
+        """The RFB port for this VM, or 0 when it has no RFB display.
+
+        An explicit ``vnc_port`` (a VM launched with a hand-picked ``-vnc``) or
+        ``vnc`` spec wins. Otherwise the port is derived from the QMP port,
+        which the launcher guarantees to be unique per VM; see
+        :mod:`vm_harness.vnc.display` for why a derivation beats an allocation
+        here. A QMP port outside the reserved window yields 0 rather than an
+        exception, because a VM that cannot be captured over RFB is still a VM
+        that can be captured by screendump.
+        """
+        configured = data.get("vnc_port")
+        if isinstance(configured, str) and configured.strip():
+            try:
+                return parse_vnc_port(configured)
+            except VncEndpointError as exc:
+                log.warning("ignoring unusable vnc_port in the config for this VM: %s", exc)
+        explicit = _as_int(configured)
+        if explicit is not None and explicit > 0:
+            return explicit
+        base = _as_int(data.get("qmp_port_base")) or 0
+        try:
+            return vnc_port_for_qmp_port(qmp_port, base) if base else vnc_port_for_qmp_port(qmp_port)
+        except VncEndpointError as exc:
+            log.info("no RFB display for this VM, capturing by screendump: %s", exc)
+            return 0
 
 
 # ── Input injection (QMP) ──────────────────────────────────────────────────────
@@ -611,7 +731,7 @@ class QMPInputInjector:
                 await self._move_task
 
 
-# ── Frame capture (QMP screendump) ────────────────────────────────────────────
+# ── Frame capture (QMP screendump and RFB) ────────────────────────────────────
 
 def encode_jpeg(image: Any, quality: int, width: int, height: int) -> bytes:
     """Transcode a captured framebuffer to JPEG at the requested size.
@@ -633,13 +753,42 @@ def encode_jpeg(image: Any, quality: int, width: int, height: int) -> bytes:
     frame.save(buffer, format="JPEG", quality=_clamp(quality, MIN_QUALITY, MAX_QUALITY))
     return buffer.getvalue()
 
-
 @dataclass(frozen=True)
 class Frame:
     """One captured framebuffer, shared read-only by every subscriber."""
+
     image: Any
     seq: int
     captured_at: float
+
+
+def image_from_framebuffer(framebuffer: Framebuffer) -> Any:
+    """Wrap a decoded RFB framebuffer as a Pillow image.
+
+    ``Image.frombuffer`` with a raw decoder *copies* into the image's own
+    buffer, and that copy is load-bearing rather than incidental. The RFB
+    decoder writes rectangles into one long-lived ``bytearray`` in place and
+    reuses it for every update, so an image that aliased that buffer would
+    change underneath every subscriber still encoding it -- a frame that
+    smears across a resize, or a torn picture, with no error anywhere. Copying
+    here is what makes a published :class:`Frame` genuinely immutable.
+
+    ``BGRX`` matches what ``Framebuffer`` always holds: the decoder normalises
+    whatever the server's pixel format was into 32-bit BGRA before anything
+    sees it, so the four-byte format is correct for every server, not just the
+    32bpp ones.
+    """
+    if Image is None:  # pragma: no cover - broken install
+        raise RuntimeError("Pillow is required to capture frames (pip install Pillow)")
+    return Image.frombuffer(
+        "RGB",
+        (framebuffer.width, framebuffer.height),
+        framebuffer.data,
+        "raw",
+        "BGRX",
+        0,
+        1,
+    )
 
 
 class JpegEncoder:
@@ -674,7 +823,17 @@ class VMStreamSource:
     The one piece of shared state is the *capture rate*, which is the fastest
     subscriber's fps. A shared capture can only run once; each subscriber then
     paces its own sends down to what it asked for.
+
+    This is the screendump implementation: poll the whole framebuffer on a
+    timer. :class:`VncCaptureSource` inherits everything here -- the subscriber
+    queues, the frame pacing, the shared :class:`JpegEncoder`, the run-state
+    query, the input injector and the auto-resume watchdog -- and replaces only
+    the loop, because everything above the loop is transport-independent and
+    duplicating it would be how the two paths drift apart.
     """
+
+    #: Reported in logs and available to tests: which capture source is running.
+    transport = CAPTURE_SOURCE_SCREENDUMP
 
     def __init__(
         self,
@@ -828,6 +987,10 @@ class VMStreamSource:
     def subscriber_count(self) -> int:
         return len(self._subscribers)
 
+    def other_subscribers(self, excluding: Optional[asyncio.Queue]) -> int:
+        """How many subscribers there are besides ``excluding``."""
+        return sum(1 for queue in self._subscribers if queue is not excluding)
+
     @property
     def encoder(self) -> JpegEncoder:
         return self._encoder
@@ -880,48 +1043,70 @@ class VMStreamSource:
 
     async def _run(self) -> None:
         while self._subscribers:
-            started = time.monotonic()
-            try:
-                frame = await self.capture_frame()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                log.warning("capture failed for VM %s: %s", self.target.name, exc)
-                # Report and keep the loop alive: a paused VM should freeze the
-                # picture, not disconnect every client watching it.
-                self._publish("error", f"capture failed: {exc}")
-                if not getattr(self._client, "is_connected", False):
-                    await self._discard_client()
-                # A stopped guest makes the next screendump hang, so the pump
-                # has to bring it back itself. If QEMU simply forgot the VM was
-                # supposed to be running, `cont` is the whole cure; if the
-                # guest genuinely crashed, cont fails and the loop keeps
-                # reporting rather than dying. Rate-limited so a guest that
-                # refuses to wake does not get a stop per frame.
-                if "not running" in str(exc).lower() or "paused" in str(exc).lower():
-                    now = time.monotonic()
-                    if now >= self._next_resume_at:
-                        self._next_resume_at = now + 2.0
-                        try:
-                            client = await self.client()
-                            status = await asyncio.wait_for(
-                                client.send("query-status", {}), timeout=5
-                            )
-                            state = (status.get("return") or {}).get("status", "")
-                            if state == "paused":
-                                await asyncio.wait_for(client.send("cont", {}), timeout=5)
-                                # From here on a screendump is valid again.
-                                self._next_resume_at = time.monotonic() + 1.0
-                                log.info("resumed paused VM %s", self.target.name)
-                        except Exception as resume_exc:  # noqa: BLE001
-                            log.debug(
-                                "resume attempt for %s did not succeed: %s",
-                                self.target.name, resume_exc,
-                            )
-            else:
-                self._publish("frame", frame)
-            elapsed = time.monotonic() - started
-            await asyncio.sleep(max(0.0, (1.0 / self.target_fps()) - elapsed))
+            await self._capture_once_paced()
+
+    async def _capture_once_paced(self) -> None:
+        """One screendump, published, then wait out whatever is left of the tick.
+
+        The capture rate is the fastest subscriber's fps, so the sleep is the
+        tick minus the time the capture actually took -- never a flat sleep,
+        which would make the achieved rate depend on how fast the guest
+        happened to be drawing.
+        """
+        started = time.monotonic()
+        try:
+            frame = await self.capture_frame()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("capture failed for VM %s: %s", self.target.name, exc)
+            # Report and keep the loop alive: a paused VM should freeze the
+            # picture, not disconnect every client watching it.
+            self._publish("error", f"capture failed: {exc}")
+            if not getattr(self._client, "is_connected", False):
+                await self._discard_client()
+            await self._resume_if_paused(exc)
+        else:
+            self._publish("frame", frame)
+        elapsed = time.monotonic() - started
+        await asyncio.sleep(max(0.0, (1.0 / self.target_fps()) - elapsed))
+
+    async def _resume_if_paused(self, exc: BaseException) -> None:
+        """Prod a VM that reports itself as not running back into running.
+
+        A stopped guest makes the next screendump hang, so the pump has to bring
+        it back itself. If QEMU simply forgot the VM was supposed to be running,
+        ``cont`` is the whole cure; if the guest genuinely crashed, ``cont``
+        fails and the loop keeps reporting rather than dying. Rate-limited so a
+        guest that refuses to wake does not get a stop per frame.
+
+        Only *tries* when the failure looks like a stopped guest. The screendump
+        path triggers this from its own exceptions, where "paused" shows up as
+        text; the RFB path never sees such an exception (a paused guest is
+        simply silent) and calls this with the stall itself once it has read
+        ``paused`` from QMP, so the check below is skipped for it.
+        """
+        text = str(exc).lower()
+        if "not running" not in text and "paused" not in text:
+            return
+        now = time.monotonic()
+        if now < self._next_resume_at:
+            return
+        self._next_resume_at = now + 2.0
+        try:
+            client = await self.client()
+            status = await asyncio.wait_for(client.send("query-status", {}), timeout=5)
+            state = (status.get("return") or {}).get("status", "")
+            if state == "paused":
+                await asyncio.wait_for(client.send("cont", {}), timeout=5)
+                # From here on a screendump is valid again.
+                self._next_resume_at = time.monotonic() + 1.0
+                log.info("resumed paused VM %s", self.target.name)
+        except Exception as resume_exc:  # noqa: BLE001
+            log.debug(
+                "resume attempt for %s did not succeed: %s",
+                self.target.name, resume_exc,
+            )
 
     async def close(self) -> None:
         if self._pump is not None and not self._pump.done():
@@ -932,6 +1117,259 @@ class VMStreamSource:
         self._subscribers.clear()
         await self.injector.close()
         await self._discard_client()
+
+
+class VncCaptureSource(VMStreamSource):
+    """One framebuffer read from QEMU's own VNC server, shared by every client.
+
+    This is the source that removes the per-frame cost of ``screendump``. What
+    ``screendump`` costs, per frame, is a QMP round trip on a socket that only
+    accepts one client, QEMU PNG-encoding the *whole* framebuffer, this process
+    PNG-decoding it, and a JPEG encode per subscriber -- full frame, every
+    frame, whether anything changed or not. Measured at 40-70ms per frame on
+    this host, which is why the practical capture rate was 15-25fps no matter
+    what anyone asked for.
+
+    RFB replaces all of that with one persistent TCP connection where *the
+    server* decides what changed: the client asks for incremental updates,
+    QEMU sends only the damaged rectangles, and a frame is presented when an
+    update completes. No socket round trip per frame, no PNG round trip, no
+    full-frame transfer. What remains is the JPEG encode, which is per-subscriber
+    and unavoidable without changing what subscribers consume.
+
+    Push, not poll
+    --------------
+    The loop here is driven by incoming updates. A timer that woke up to ask
+    "is there a frame yet?" would reintroduce exactly the latency being removed,
+    and would additionally cap the source at the timer, so there is no tick in
+    this class: ``VNCClient.serve`` is awaited and each update publishes itself.
+
+    What is deliberately *not* here: this source does not replace the screendump
+    source, it is tried first. See :meth:`_run` for the fallback.
+
+    Also inherited unchanged, because none of it is transport-specific: the
+    latest-wins subscriber queues and their per-client fps, the single shared
+    :class:`JpegEncoder` (N subscribers resize the same :class:`Image`, so the
+    per-VM lock is still what makes that safe), the QMP connection for input,
+    ``run_state`` from ``query-status``, and the auto-resume watchdog -- with the
+    one difference that RFB needs a *timer* to trigger it, because a paused guest
+    is silent over RFB rather than an error.
+    """
+
+    transport = CAPTURE_SOURCE_VNC
+
+    def __init__(
+        self,
+        target: VMTarget,
+        client_factory: Optional[Callable[[str], Any]] = None,
+        capture_fps: int = MAX_FPS,
+        tablet_device: Optional[str] = None,
+        vnc_client_factory: Optional[Callable[..., Any]] = None,
+        frame_interval: float = VNC_FRAME_REQUEST_INTERVAL,
+        vnc_host: str = VNC_BIND_HOST,
+    ) -> None:
+        super().__init__(
+            target,
+            client_factory=client_factory,
+            capture_fps=capture_fps,
+            tablet_device=tablet_device,
+        )
+        self._vnc_client_factory = vnc_client_factory or (
+            lambda host, port: VNCClient(host, port)
+        )
+        self._frame_interval = frame_interval
+        self._vnc_host = vnc_host
+        self._rfb: Any = None
+        self._rfb_lock = asyncio.Lock()
+        #: When the framebuffer last changed. ``None`` while not connected.
+        self._last_update_at: Optional[float] = None
+        #: False once an RFB attempt has failed, so the loop stops re-probing
+        #: every tick; the screendump fallback retries it on a timer instead.
+        self._vnc_available: Optional[bool] = None
+        self._screendump_until = 0.0
+        self._vnc_error = ""
+
+    @property
+    def vnc_port(self) -> int:
+        return self.target.vnc_port
+
+    def unsubscribe(self, queue: asyncio.Queue) -> None:
+        """Detach a queue, and drop the RFB session when the last one goes.
+
+        The teardown is done here, synchronously, rather than left to the
+        capture task's own ``finally``. That was measured, not assumed: a
+        cancelled asyncio task does not always notice promptly on Windows --
+        when it is waiting on a future that refuses cancellation the request
+        just sits as ``_must_cancel`` -- and a session whose state outlives its
+        task blocks the next one from connecting ("an RFB session is already
+        running"), which shows up as a silent fall back to screendump.
+
+        ``stop()`` closes the transport, which is what actually frees the
+        socket, and it returns immediately.
+        """
+        super().unsubscribe(queue)
+        if not self._subscribers:
+            self._drop_rfb_session()
+
+    def _drop_rfb_session(self) -> None:
+        client, self._rfb = self._rfb, None
+        self._last_update_at = None
+        if client is None:
+            return
+        with contextlib.suppress(Exception):
+            client.on_frame = None
+            client.stop()
+
+    async def _run(self) -> None:
+        """RFB, then screendump, re-probing RFB on a timer.
+
+        The fallback is not a mode a user has to pick: a VM launched without
+        ``-vnc`` refuses the connection instantly, and what should happen then is
+        the bridge behaving exactly as it did before this class existed. So the
+        first RFB failure hands over to :meth:`VMStreamSource._capture_once_paced`
+        -- the old loop, unmodified -- and hands RFB back
+        :data:`VNC_RETRY_INTERVAL` later so a VM that was relaunched with a VNC
+        display recovers without restarting the bridge or dropping viewers.
+        """
+        while self._subscribers:
+            if self._pump is not asyncio.current_task():
+                # A newer capture task has taken over. This one is a leftover
+                # from a session that was dropped while its task was still
+                # unwinding, and it must not capture anything -- least of all
+                # fall back to screendump on behalf of a session that no longer
+                # exists.
+                return
+            if self._vnc_available is not False:
+                try:
+                    await self._serve_rfb()
+                    # serve() only returns on a clean close; without
+                    # subscribers there is nothing left to capture.
+                    continue
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    self._vnc_available = False
+                    self._vnc_error = str(exc)
+                    self._screendump_until = time.monotonic() + VNC_RETRY_INTERVAL
+                    log.warning(
+                        "RFB capture unavailable for VM %s (%s); falling back to QMP "
+                        "screendump, retrying RFB in %.0fs",
+                        self.target.name, exc, VNC_RETRY_INTERVAL,
+                    )
+                    self._publish(
+                        "error",
+                        f"vnc capture unavailable ({exc}); using qmp screendump",
+                    )
+                continue
+            await self._capture_once_paced()
+            if time.monotonic() >= self._screendump_until:
+                self._vnc_available = None
+                log.info("retrying RFB capture for VM %s", self.target.name)
+
+    async def _serve_rfb(self) -> None:
+        """Hold one RFB session open until it fails or is cancelled."""
+        port = self.target.vnc_port
+        if not port:
+            raise VncEndpointError(
+                f"VM {self.target.name} has no VNC display; it was launched without -vnc"
+            )
+        async with self._rfb_lock:
+            if self._rfb is not None:
+                raise RuntimeError("an RFB session is already running for this VM")
+            client = self._vnc_client_factory(self._vnc_host, port)
+            client.on_frame = self._on_rfb_frame
+            self._rfb = client
+            self._last_update_at = time.monotonic()
+            watchdog = asyncio.get_running_loop().create_task(self._watch_stalled_guest())
+        try:
+            await client.connect()
+            log.info(
+                "RFB capture connected for VM %s at %s:%d",
+                self.target.name, self._vnc_host, port,
+            )
+            await client.serve(frame_interval=self._frame_interval)
+        finally:
+            # Nothing in here awaits, and that is the whole point.
+            #
+            # This block runs during cancellation too. An ``await`` in a task
+            # that is already unwinding either raises CancelledError at once --
+            # so cleanup after the first await never runs -- or, on the Windows
+            # Proactor transport, blocks in ``wait_closed()`` for ever and hangs
+            # the capture task outright. Both were found by measuring a booted
+            # VM: the first left ``_rfb`` set and turned the next attach into
+            # "an RFB session is already running", the second left a task that
+            # never finished, so ``close()`` never returned.
+            #
+            # ``VNCClient.stop()`` is the synchronous teardown and it is
+            # documented as the prompt one: it closes the transport, which is
+            # what actually lets the socket go. ``close()`` afterwards only
+            # clears fields on an object that is about to be collected, so it
+            # is not worth the risk of waiting on it.
+            self._rfb = None
+            self._last_update_at = None
+            client.on_frame = None
+            watchdog.cancel()
+            client.stop()
+
+    async def _on_rfb_frame(self, framebuffer: Framebuffer) -> None:
+        """Publish one completed RFB update. This is the whole push path.
+
+        Called by ``VNCClient`` from inside the receive loop, so it must not
+        block: it builds a :class:`Frame` and puts it on each subscriber's
+        latest-wins queue, both of which are O(subscribers) and non-blocking.
+        The JPEG encode that follows is the subscriber's job, in its own task,
+        for exactly this reason.
+        """
+        self._seq += 1
+        self._last_update_at = time.monotonic()
+        self._publish("frame", Frame(
+            image=image_from_framebuffer(framebuffer),
+            seq=self._seq,
+            captured_at=self._last_update_at,
+        ))
+
+    async def _watch_stalled_guest(self) -> None:
+        """Ask QMP to resume a guest whose framebuffer has stopped changing.
+
+        Over RFB a paused guest does not fail: the connection stays open and
+        simply no damage arrives, so the screendump path's error-triggered
+        watchdog has nothing to fire on and the console would sit on a frozen
+        picture indefinitely. The detection is the same question -- is this
+        guest paused? -- asked on a timer instead of on an exception.
+
+        It asks on the QMP connection this source already holds, never a second
+        one: QMP serves a single client, and opening another here would fight the
+        input injector for the same socket.
+
+        Silence alone is not evidence, so ``running`` is never inferred from it:
+        an idle desktop damages nothing for minutes at a time, and calling that
+        paused is the failure mode the screendump path's own docstring warns
+        about. Only an explicit ``paused`` from ``query-status`` is acted on.
+        """
+        while True:
+            await asyncio.sleep(VNC_STALL_CHECK_INTERVAL)
+            last = self._last_update_at
+            if last is None or (time.monotonic() - last) < VNC_STALL_SEC:
+                continue
+            if time.monotonic() < self._next_resume_at:
+                continue
+            self._next_resume_at = time.monotonic() + 2.0
+            try:
+                client = await self.client()
+                status = await asyncio.wait_for(client.send("query-status", {}), timeout=5)
+                state = (status.get("return") or {}).get("status", "")
+                if state != "paused":
+                    continue
+                await asyncio.wait_for(client.send("cont", {}), timeout=5)
+                self._next_resume_at = time.monotonic() + 1.0
+                log.info(
+                    "resumed paused VM %s (RFB saw no damage for %.0fs)",
+                    self.target.name, VNC_STALL_SEC,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log.debug("RFB stall check for %s did not succeed: %s", self.target.name, exc)
 
 
 class FrameSubscriber:
@@ -1222,6 +1660,10 @@ class ClientSession:
     width: int = DEFAULT_WIDTH
     height: int = DEFAULT_HEIGHT
     input_enabled: bool = True
+    #: Which capture source this client asked for, or None for the bridge
+    #: default. Per client, like everything else in here: it never reaches
+    #: another session.
+    capture_source: Optional[str] = None
     vm: Optional[str] = None
     source: Optional[VMStreamSource] = None
     subscriber: Optional[FrameSubscriber] = None
@@ -1256,6 +1698,7 @@ class StreamingBridge:
         vms_dir: Optional[os.PathLike[str] | str] = None,
         exec_sessions: Optional[ExecSessionManager] = None,
         env: Optional[Dict[str, str]] = None,
+        capture_source: Optional[str] = None,
     ) -> None:
         env = os.environ if env is None else env
         self.registry = registry or VMRegistry(vms_dir=vms_dir, env=env)
@@ -1264,6 +1707,9 @@ class StreamingBridge:
         self.host = host if host is not None else (env.get(HOST_ENV) or BRIDGE_WS_HOST)
         self.port = port if port is not None else _as_int(env.get(PORT_ENV)) or BRIDGE_WS_PORT
         self._tablet_device = env.get(TABLET_DEVICE_ENV) or None
+        self.capture_source = normalise_capture_source(
+            capture_source if capture_source is not None else env.get(CAPTURE_SOURCE_ENV)
+        )
         self.exec_sessions = exec_sessions or ExecSessionManager()
         self.clients: Dict[str, ClientSession] = {}
         self.sources: Dict[str, VMStreamSource] = {}
@@ -1317,16 +1763,68 @@ class StreamingBridge:
 
     # -- per-VM sources -----------------------------------------------------
 
-    def source_for(self, target: VMTarget) -> VMStreamSource:
-        """The one capture+injector for ``target``, created on first use."""
+    def source_for(self, target: VMTarget, capture_source: Optional[str] = None,
+                       detaching: Optional[asyncio.Queue] = None) -> VMStreamSource:
+        """The one capture+injector for ``target``, created on first use.
+
+        A VM's framebuffer is shared by every viewer, so it has exactly one
+        capture source. When a client asks for a different transport than the
+        one in force, the request is honoured only if the requester is the only
+        thing watching: an idle source is swapped freely, and so is one whose
+        sole subscriber is the queue being given up. With other viewers attached
+        the source is left alone and :meth:`_attach` says so, rather than
+        quietly handing back the other transport.
+        """
+        wanted = self._wanted_capture_source(target, capture_source)
         source = self.sources.get(target.name)
-        if source is None:
-            source = VMStreamSource(
-                target, client_factory=self._client_factory,
+        if source is not None:
+            if source.transport == wanted:
+                return source
+            if source.other_subscribers(detaching):
+                return source
+            # Nobody else is watching. Give up the queue first so the old
+            # source stops capturing before it is dropped.
+            if detaching is not None:
+                source.unsubscribe(detaching)
+            self.sources.pop(target.name, None)
+        source = self._build_source(target, wanted)
+        self.sources[target.name] = source
+        return source
+
+    def _wanted_capture_source(self, target: VMTarget, capture_source: Optional[str]) -> str:
+        """Resolve a request to one of the two transports that actually exist.
+
+        ``auto`` becomes a concrete answer here rather than at the point of use,
+        for two reasons: the "is this what you asked for?" check in
+        :meth:`_attach` compares against a transport name and needs one, and a
+        source must never come back as something other than what it is.
+        """
+        wanted = normalise_capture_source(capture_source, self.capture_source)
+        if wanted == CAPTURE_SOURCE_AUTO:
+            return CAPTURE_SOURCE_VNC if target.vnc_port else CAPTURE_SOURCE_SCREENDUMP
+        if wanted == CAPTURE_SOURCE_VNC and not target.vnc_port:
+            # Asked for explicitly and cannot be done. Screendump rather than an
+            # error: the alternative to a working console is no console, and the
+            # reason is logged so the request is not silently ignored.
+            log.warning(
+                "capture source %r requested for VM %s but it has no VNC display "
+                "(launched without -vnc); using qmp screendump",
+                CAPTURE_SOURCE_VNC, target.name,
+            )
+            return CAPTURE_SOURCE_SCREENDUMP
+        return wanted
+
+    def _build_source(self, target: VMTarget, wanted: str) -> VMStreamSource:
+        if wanted == CAPTURE_SOURCE_VNC:
+            log.info("capturing VM %s from RFB at 127.0.0.1:%d", target.name, target.vnc_port)
+            return VncCaptureSource(
+                target,
+                client_factory=self._client_factory,
                 tablet_device=self._tablet_device,
             )
-            self.sources[target.name] = source
-        return source
+        return VMStreamSource(
+            target, client_factory=self._client_factory, tablet_device=self._tablet_device,
+        )
 
     # -- stream endpoint ----------------------------------------------------
 
@@ -1514,6 +2012,18 @@ class StreamingBridge:
         if message.get("input_enabled") is not None:
             session.input_enabled = bool(message["input_enabled"])
 
+        # A capture source change is the one config field that cannot be applied
+        # in place: the transport is baked into the source object at creation, so
+        # switching means re-attaching. Anything else here is per-session state
+        # that takes effect on the next frame.
+        requested_source = message.get("capture_source")
+        source_changed = requested_source is not None and (
+            normalise_capture_source(requested_source, CAPTURE_SOURCE_AUTO)
+            != normalise_capture_source(session.capture_source, CAPTURE_SOURCE_AUTO)
+        )
+        if requested_source is not None:
+            session.capture_source = normalise_capture_source(requested_source)
+
         if violation is None:
             session.quality = values["quality"]
             session.fps = values["fps"]
@@ -1544,6 +2054,11 @@ class StreamingBridge:
         vm = message.get("vm")
         if isinstance(vm, str) and vm:
             await self._attach(session, vm)
+        elif source_changed and session.vm:
+            # Same VM, different capture source. Re-attaching is what swaps the
+            # transport; the subscriber is rebuilt at this client's own settings
+            # and every other session on the same VM keeps what it had.
+            await self._attach(session, session.vm)
 
     async def _attach(self, session: ClientSession, vm: Any) -> None:
         """Point this client at a VM, starting a shared capture if it is idle."""
@@ -1551,7 +2066,27 @@ class StreamingBridge:
         if target is None:
             await self._send_error(session, f"unknown VM {vm!r}; known VMs are {self.registry.list_vms()}")
             return
-        source = self.source_for(target)
+        detaching = session.subscriber.queue if session.subscriber is not None else None
+        source = self.source_for(target, session.capture_source, detaching)
+        wanted = self._wanted_capture_source(target, session.capture_source)
+        if wanted != source.transport:
+            # Said rather than silently ignored: this client asked for a
+            # transport and is getting another one, and the reason is that
+            # somebody else already has the framebuffer.
+            await self._send_error(
+                session,
+                f"capture source {wanted!r} was requested but VM {target.name} is "
+                f"already being captured by {source.transport!r} for another viewer; "
+                f"a VM's framebuffer is captured once and shared",
+            )
+        if session.subscriber is not None and session.source is source and session.vm == target.name:
+            # Already watching exactly this, on exactly this transport. The panel
+            # sends config-then-subscribe on every (re)connect, and tearing the
+            # subscriber down and rebuilding it there would close and reopen the
+            # RFB session for nothing -- dropping the first full-screen frame
+            # every time and giving up the connection the source had already
+            # established.
+            return
         if session.subscriber is not None:
             await session.subscriber.stop()
             session.subscriber = None

@@ -14,6 +14,9 @@ Layers, each usable on its own:
     The asyncio connection: handshake, VNC Auth, the receive loop, and input.
 ``keysym``
     X keysyms to the key names :mod:`vm_harness.guest_input` already speaks.
+``display``
+    Which port QEMU's own VNC server listens on for a given VM, and the
+    loopback-only ``-vnc`` argument that goes on its command line.
 
 The renderer lives outside this package, in ``gui.widgets_vnc``, and depends on
 Qt; nothing in here imports Qt, so the protocol stays testable headless.
@@ -25,6 +28,22 @@ too.
 from __future__ import annotations
 
 from vm_harness.vnc.client import DEFAULT_FRAME_REQUEST_INTERVAL, VNCClient
+from vm_harness.vnc.display import (
+    DEFAULT_QMP_PORT_BASE,
+    MAX_VNC_PORT,
+    MIN_VNC_PORT,
+    VNC_BIND_HOST,
+    VNC_DISPLAY_BASE,
+    VNC_DISPLAY_PORT_BASE,
+    VNC_SHARE_MODE,
+    VncEndpointError,
+    is_loopback,
+    parse_vnc_port,
+    vnc_arg_for_qmp_port,
+    vnc_display_arg,
+    vnc_display_for_qmp_port,
+    vnc_port_for_qmp_port,
+)
 from vm_harness.vnc.keysym import is_mapped_keysym, key_name_for_keysym
 from vm_harness.vnc.proto import (
     BGRX32,
@@ -51,12 +70,15 @@ __all__ = [
     "AuthError",
     "BGRX32",
     "DEFAULT_FRAME_REQUEST_INTERVAL",
+    "DEFAULT_QMP_PORT_BASE",
     "ENCODING_COPY_RECT",
     "ENCODING_DESKTOP_SIZE",
     "ENCODING_HEXTILE",
     "ENCODING_RAW",
     "ENCODING_RRE",
     "ENCODING_TIGHT",
+    "MAX_VNC_PORT",
+    "MIN_VNC_PORT",
     "Framebuffer",
     "HandshakeError",
     "PixelFormat",
@@ -67,7 +89,18 @@ __all__ = [
     "SUPPORTED_SECURITY_TYPES",
     "ServerInit",
     "UnsupportedEncoding",
+    "VNC_BIND_HOST",
     "VNCClient",
+    "VNC_DISPLAY_BASE",
+    "VNC_DISPLAY_PORT_BASE",
+    "VNC_SHARE_MODE",
+    "VncEndpointError",
+    "is_loopback",
     "is_mapped_keysym",
     "key_name_for_keysym",
+    "parse_vnc_port",
+    "vnc_arg_for_qmp_port",
+    "vnc_display_arg",
+    "vnc_display_for_qmp_port",
+    "vnc_port_for_qmp_port",
 ]

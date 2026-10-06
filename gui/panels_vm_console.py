@@ -173,6 +173,19 @@ MIN_DIMENSION = 64
 MAX_WIDTH = 3840
 MAX_HEIGHT = 2160
 
+#: Capture source choices, in the order they are offered. The value is what goes
+#: on the wire in ``config.capture_source`` and is the same vocabulary the bridge
+#: normalises with, so the panel cannot invent a spelling the bridge has to guess
+#: at. Default first because RFB is the better source wherever it exists.
+CAPTURE_SOURCE_CHOICES: Tuple[Tuple[str, str], ...] = (
+    ("Auto (VNC when available)", "auto"),
+    ("VNC (fast, damage-only)", "vnc"),
+    ("QMP screendump (any VM)", "screendump"),
+)
+DEFAULT_CAPTURE_SOURCE_CHOICE = "auto"
+_CAPTURE_SOURCE_BY_VALUE = {value: label for label, value in CAPTURE_SOURCE_CHOICES}
+_CAPTURE_SOURCE_BY_LABEL = {label: value for label, value in CAPTURE_SOURCE_CHOICES}
+
 #: Modifier that turns a drag into view panning instead of pointer movement.
 PAN_MODIFIER = Qt.ControlModifier
 
@@ -548,6 +561,23 @@ class VMConsolePanel(QWidget):
             "event for this session. Useful when someone else is driving the "
             "same VM."
         )
+        # Which framebuffer reader the bridge uses. VNC streams only the changed
+        # regions from QEMU itself, so it is both faster and cheaper than
+        # screendump, which re-encodes and re-transfers the whole screen every
+        # frame; screendump is here because it works for a VM launched without a
+        # VNC display, which is the case where VNC cannot.
+        self._capture_combo = QComboBox()
+        self._capture_combo.setStyleSheet(combo_style())
+        self._capture_combo.addItems([label for label, _ in CAPTURE_SOURCE_CHOICES])
+        self._capture_combo.setToolTip(
+            "How the bridge gets frames. 'VNC' reads QEMU's own VNC server, "
+            "which pushes only what changed. 'QMP screendump' re-reads the "
+            "whole framebuffer over QMP each frame and works for any VM. "
+            "'Auto' uses VNC when the VM has a VNC display and screendump "
+            "otherwise. A VM's framebuffer is captured once and shared, so this "
+            "only changes when nobody else is watching that VM."
+        )
+        self._capture_combo.currentTextChanged.connect(self._on_config_field_changed)
         for spin in (self._fps_spin, self._quality_spin,
                      self._width_spin, self._height_spin):
             spin.valueChanged.connect(self._on_config_field_changed)
@@ -566,6 +596,8 @@ class VMConsolePanel(QWidget):
         r3.addWidget(QLabel("x"))
         r3.addWidget(self._height_spin)
         r3.addWidget(self._input_check)
+        r3.addWidget(QLabel("Capture"))
+        r3.addWidget(self._capture_combo)
         r3.addStretch()
         card.content_layout.addWidget(row3)
 
@@ -738,6 +770,20 @@ class VMConsolePanel(QWidget):
             self._input_check.setChecked(
                 bool(stored.get("input_enabled", True))
             )
+            # An unrecognised stored value falls back to the default rather than
+            # leaving the combo on nothing: a settings file written by a build
+            # that knew transports this one does not is not a reason to lose the
+            # picture.
+            wanted_source = str(
+                stored.get("capture_source") or DEFAULT_CAPTURE_SOURCE_CHOICE
+            ).strip().lower()
+            self._capture_combo.blockSignals(True)
+            self._capture_combo.setCurrentText(
+                _CAPTURE_SOURCE_BY_VALUE.get(
+                    wanted_source, _CAPTURE_SOURCE_BY_VALUE[DEFAULT_CAPTURE_SOURCE_CHOICE]
+                )
+            )
+            self._capture_combo.blockSignals(False)
             self._token_input.setText(self._load_token())
         finally:
             self._loading_settings = False
@@ -751,6 +797,7 @@ class VMConsolePanel(QWidget):
             "width": self._width_spin.value(),
             "height": self._height_spin.value(),
             "input_enabled": bool(self._input_check.isChecked()),
+            "capture_source": self.selected_capture_source(),
         }
         if self._stored_settings() == wanted:
             return
@@ -947,6 +994,12 @@ class VMConsolePanel(QWidget):
 
     # ── Configuration messages ───────────────────────────────────────────────
 
+    def selected_capture_source(self) -> str:
+        """The wire value for the capture-source combo (``auto``/``vnc``/``screendump``)."""
+        return _CAPTURE_SOURCE_BY_LABEL.get(
+            self._capture_combo.currentText(), DEFAULT_CAPTURE_SOURCE_CHOICE
+        )
+
     def requested_config(self) -> Dict[str, Any]:
         vm = self.selected_vm()
         payload: Dict[str, Any] = {
@@ -956,6 +1009,7 @@ class VMConsolePanel(QWidget):
             "width": self._width_spin.value(),
             "height": self._height_spin.value(),
             "input_enabled": bool(self._input_check.isChecked()),
+            "capture_source": self.selected_capture_source(),
         }
         if vm:
             payload["vm"] = vm
@@ -978,7 +1032,8 @@ class VMConsolePanel(QWidget):
         )
         self._ack_label.setText(
             f"config requested: {payload['width']}x{payload['height']} @ "
-            f"{payload['fps']}fps, quality {payload['quality']}, input "
+            f"{payload['fps']}fps, quality {payload['quality']}, capture "
+            f"{payload['capture_source']}, input "
             f"{'on' if payload['input_enabled'] else 'off'} - awaiting ack"
         )
 
