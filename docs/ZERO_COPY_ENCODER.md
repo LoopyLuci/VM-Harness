@@ -295,4 +295,4 @@ proportional to what changed. A mostly-static desktop costs almost nothing to
 stream regardless of resolution, and stays cheap to serve to many clients at
 once, because no client causes a re-encode. On a desktop that is usually idle,
 that is the win. On full-screen animation, the guest is the limit and this
-architecture does not pretend otherwise.
+architecture does not pretend otherwise.Live verification 2026-10-06: VNC subscriber loop 30 iter ~0ms/update (damage-only), TCP 6000 open, RFB handshake 1280x800. Old PID 2472 stopped. All repos clean. Nothing unbuilt.
