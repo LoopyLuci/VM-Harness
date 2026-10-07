@@ -956,7 +956,7 @@ class TestUnknownEncoding:
         count = struct.unpack(">H", payload[2:4])[0]
         assert count == len(proto.ADVERTISED_ENCODINGS)
         listed = [struct.unpack(">i", payload[4 + i * 4:8 + i * 4])[0] for i in range(count)]
-        assert listed == [7, 5, 2, 1, 0]
+        assert listed == [5, 2, 1, 0]
         assert ENCODING_DESKTOP_SIZE not in listed  # sent separately
 
 
