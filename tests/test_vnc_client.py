@@ -107,6 +107,58 @@ def bgra_at(fb: Framebuffer, x: int, y: int) -> tuple[int, int, int]:
     return r, g, b
 
 
+def hextile_tile(
+    *,
+    background: tuple[int, int, int] | None = None,
+    foreground: tuple[int, int, int] | None = None,
+    subrects: list[tuple[int, int, int, int]] = (),
+    coloured: tuple[int, int, int] | None = None,
+) -> bytes:
+    """One Hextile tile, in the framing QEMU 11.1 actually writes.
+
+    The flags byte is a *mask*: bit 0 Raw, bit 1 BackgroundSpecified, bit 2
+    ForegroundSpecified, bit 3 AnySubrects, bit 4 SubrectsColoured. Building
+    tiles from named flags rather than from literal bytes is deliberate: the
+    bug this file's ``TestHextile`` used to encode was reading those five bits
+    as sequential identifiers 0..4, which every real server contradicts.
+
+    A sub-rectangle is two packed-nibble bytes and stores ``w - 1`` and
+    ``h - 1``, so a full-width run encodes as ``0x0F``. ``subrects`` takes
+    1-based extents and does that decrement here.
+    """
+    if background is None and foreground is None and not subrects and coloured is None:
+        # A tile that states nothing at all: solid carried background, one byte.
+        return bytes((0x00,))
+    flags = proto.HEXTILE_ANY_SUBRECTS if subrects else 0
+    payload = bytearray()
+    if background is not None:
+        flags |= proto.HEXTILE_BACKGROUND_SPECIFIED
+    if foreground is not None:
+        flags |= proto.HEXTILE_FOREGROUND_SPECIFIED
+    if coloured is not None:
+        flags |= proto.HEXTILE_SUBRECTS_COLOURED
+    payload.append(flags)
+    if background is not None:
+        payload += bgrx_pixels([background])
+    if foreground is not None:
+        payload += bgrx_pixels([foreground])
+    if subrects:
+        payload.append(len(subrects))
+    for index, (sx, sy, sw, sh) in enumerate(subrects):
+        if coloured is not None and index == 0:
+            payload += bgrx_pixels([coloured])
+        elif coloured is not None:
+            raise ValueError("this builder colours only the first sub-rectangle")
+        payload.append((sx << 4) | sy)
+        payload.append(((sw - 1) << 4) | (sh - 1))
+    return bytes(payload)
+
+
+def hextile_raw_tile(colour: tuple[int, int, int], width: int, height: int) -> bytes:
+    """One Raw Hextile tile: the flags byte, then width*height pixels."""
+    return bytes((proto.HEXTILE_RAW,)) + bgrx_pixels([colour] * (width * height))
+
+
 #: A palette pixel format: true-colour false. Sent straight to the client so the
 #: rejection happens at ServerInit rather than at the first pixel.
 _PALETTE_PIXEL_FORMAT = bytes((8, 8, 0, 0, 255, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0))
@@ -119,6 +171,20 @@ async def decode_rect(fb: Framebuffer, rect_bytes: bytes, fmt=proto.BGRX32):
     header = proto.Rectangle.decode(proto.ByteReader(rect_bytes[:12]))
     payload = rect_bytes[12:]
     return await proto.decode_rectangle(fb, header, fmt, AsyncByteReader(payload))
+
+
+async def decode_rect_exact(fb: Framebuffer, rect_bytes: bytes, fmt=proto.BGRX32) -> int:
+    """Like :func:`decode_rect`, but also returns the bytes left unread.
+
+    A Hextile or Tight decoder that reads the wrong number of bytes per tile
+    leaves a remainder, and asserting on that remainder is what makes a
+    one-byte drift fail a test instead of quietly producing a plausible screen.
+    """
+    header = proto.Rectangle.decode(proto.ByteReader(rect_bytes[:12]))
+    payload = rect_bytes[12:]
+    source = AsyncByteReader(payload)
+    await proto.decode_rectangle(fb, header, fmt, source)
+    return source.remaining
 
 
 # ── Fake server ───────────────────────────────────────────────────────────────
@@ -751,29 +817,77 @@ class TestRRE:
 
 
 class TestHextile:
+    """Hextile's sub-encoding byte is a flag *mask*, and its sub-rectangles are
+    two packed nibbles storing ``w - 1`` / ``h - 1``.
+
+    Every case here is built from :func:`hextile_tile` so the framing lives in
+    one place. QEMU 11.1 writes a single screen's tiles as 0x00, 0x01, 0x02,
+    0x04, 0x06, 0x08, 0x0f and 0x18 -- a set that is only self-consistent if
+    those are independent bits.
+    """
+
     async def test_raw_tile(self):
         fb = Framebuffer(32, 32)
-        tile = bgrx_pixels([(3, 4, 5)] * (16 * 16))
-        await decode_rect(fb, rect_header(0, 0, 16, 16, ENCODING_HEXTILE) + b"\x00" + tile)
+        tile = hextile_raw_tile((3, 4, 5), 16, 16)
+        await decode_rect(fb, rect_header(0, 0, 16, 16, ENCODING_HEXTILE) + tile)
         assert bgra_at(fb, 0, 0) == (3, 4, 5)
         assert bgra_at(fb, 15, 15) == (3, 4, 5)
 
     async def test_background_specified_tile(self):
         fb = Framebuffer(32, 32)
-        payload = b"\x01" + bgrx_pixels([(8, 9, 10)])
+        payload = hextile_tile(background=(8, 9, 10))
         await decode_rect(fb, rect_header(0, 0, 16, 16, ENCODING_HEXTILE) + payload)
         assert bgra_at(fb, 0, 0) == (8, 9, 10)
         assert bgra_at(fb, 15, 15) == (8, 9, 10)
 
+    async def test_subrectangles_use_the_carried_foreground(self):
+        fb = Framebuffer(16, 16)
+        payload = hextile_tile(
+            background=(1, 1, 1), foreground=(2, 2, 2), subrects=[(3, 4, 5, 6)]
+        )
+        await decode_rect(fb, rect_header(0, 0, 16, 16, ENCODING_HEXTILE) + payload)
+        assert bgra_at(fb, 0, 0) == (1, 1, 1)
+        assert bgra_at(fb, 3, 4) == (2, 2, 2)
+        # The extents are w-1/h-1, so the run covers exactly 5x6 and stops.
+        assert bgra_at(fb, 7, 9) == (2, 2, 2)
+        assert bgra_at(fb, 8, 4) == (1, 1, 1)
+        assert bgra_at(fb, 3, 10) == (1, 1, 1)
+
+    async def test_a_single_pixel_run_is_not_read_as_zero_pixels(self):
+        """A one-pixel run encodes as ``w - 1 == 0``.
+
+        Reading the nibble verbatim makes the run zero-sized: the stream
+        position stays correct, so nothing raises, and the pixel simply never
+        appears. That is the failure this test exists for.
+        """
+        fb = Framebuffer(16, 16)
+        payload = hextile_tile(
+            background=(1, 1, 1), foreground=(9, 9, 9), subrects=[(2, 2, 1, 1)]
+        )
+        await decode_rect(fb, rect_header(0, 0, 16, 16, ENCODING_HEXTILE) + payload)
+        assert bgra_at(fb, 2, 2) == (9, 9, 9)
+
+    async def test_a_full_width_run_spans_the_whole_tile(self):
+        """16 pixels encode as ``0x0F``, because the nibble holds ``w - 1``."""
+        fb = Framebuffer(16, 16)
+        payload = hextile_tile(
+            background=(1, 1, 1), foreground=(9, 9, 9), subrects=[(0, 7, 16, 1)]
+        )
+        await decode_rect(fb, rect_header(0, 0, 16, 16, ENCODING_HEXTILE) + payload)
+        assert bgra_at(fb, 0, 7) == (9, 9, 9)
+        assert bgra_at(fb, 15, 7) == (9, 9, 9)
+        assert bgra_at(fb, 0, 6) == (1, 1, 1)
+        assert bgra_at(fb, 0, 8) == (1, 1, 1)
+
     async def test_repeated_tiles_reuse_the_carried_background(self):
         """The second tile states no background and inherits the first's."""
         fb = Framebuffer(32, 16)
-        payload = b"\x01" + bgrx_pixels([(1, 1, 1)])
-        payload += b"\x00"  # a Raw tile, which clears the carry
-        payload += bgrx_pixels([(2, 2, 2)] * (16 * 16))
+        payload = hextile_tile(background=(1, 1, 1))
+        payload += hextile_tile()  # flags 0x00: the whole tile is that colour
         await decode_rect(fb, rect_header(0, 0, 32, 16, ENCODING_HEXTILE) + payload)
         assert bgra_at(fb, 0, 0) == (1, 1, 1)
-        assert bgra_at(fb, 16, 0) == (2, 2, 2)
+        assert bgra_at(fb, 16, 0) == (1, 1, 1)
+        assert bgra_at(fb, 31, 15) == (1, 1, 1)
 
     async def test_background_is_not_carried_across_a_raw_tile(self):
         """The specification does not carry it; inheriting anyway shows one
@@ -782,20 +896,142 @@ class TestHextile:
         # A 16x48 rectangle is three 16x16 tiles stacked. Tile 0 states a
         # background, tile 1 is Raw -- which clears the carry -- so tile 2 has
         # nothing to inherit and must be refused.
-        payload = b"\x01" + bgrx_pixels([(1, 1, 1)])          # tile 0: bg stated
-        payload += b"\x00" + bgrx_pixels([(2, 2, 2)] * 256)   # tile 1: raw
+        payload = hextile_tile(background=(1, 1, 1))
+        payload += hextile_raw_tile((2, 2, 2), 16, 16)
+        payload += hextile_tile()
         with pytest.raises(ProtocolError):
             await decode_rect(fb, rect_header(0, 0, 16, 48, ENCODING_HEXTILE) + payload)
 
-    async def test_subrectangle_escaping_its_tile_is_rejected(self):
-        """Sub-encoding 7 is background + foreground + "last 7 sub-rectangles",
-        so the first four-byte group after the colours is a sub-rectangle."""
-        fb = Framebuffer(16, 16)
-        payload = b"\x07" + bgrx_pixels([(1, 1, 1)]) + bgrx_pixels([(2, 2, 2)])
-        payload += bytes((14, 0, 4, 4))  # 14 + 4 runs past the 16-wide tile
+    async def test_a_raw_tile_also_clears_the_carried_foreground(self):
+        """The specification forbids carrying the foreground across a Raw tile."""
+        fb = Framebuffer(16, 48)
+        # Three tiles stacked. Tile 0 states both colours, tile 1 is Raw --
+        # which clears both carries -- and tile 2 states a background but asks
+        # for a sub-rectangle with no foreground of its own to inherit.
+        payload = hextile_tile(background=(1, 1, 1), foreground=(7, 7, 7))
+        payload += hextile_raw_tile((2, 2, 2), 16, 16)
+        payload += hextile_tile(background=(3, 3, 3), subrects=[(0, 0, 1, 1)])
         with pytest.raises(ProtocolError):
-            await decode_rect(fb, rect_header(0, 0, 16, 16, ENCODING_HEXTILE) + payload)
+            await decode_rect(fb, rect_header(0, 0, 16, 48, ENCODING_HEXTILE) + payload)
 
+    async def test_subrects_coloured_supplies_its_own_colour(self):
+        """Each coloured sub-rectangle is preceded by a pixel of its own."""
+        fb = Framebuffer(16, 16)
+        payload = bytearray()
+        payload.append(
+            proto.HEXTILE_ANY_SUBRECTS | proto.HEXTILE_SUBRECTS_COLOURED
+            | proto.HEXTILE_BACKGROUND_SPECIFIED
+        )
+        payload += bgrx_pixels([(1, 1, 1)])
+        payload.append(1)
+        payload += bgrx_pixels([(5, 6, 7)])
+        payload.append((2 << 4) | 3)
+        payload.append((3 - 1) << 4 | (2 - 1))
+        await decode_rect(
+            fb, rect_header(0, 0, 16, 16, ENCODING_HEXTILE) + bytes(payload)
+        )
+        assert bgra_at(fb, 0, 0) == (1, 1, 1)
+        assert bgra_at(fb, 2, 3) == (5, 6, 7)
+        assert bgra_at(fb, 4, 3) == (5, 6, 7)
+        assert bgra_at(fb, 5, 4) == (1, 1, 1)
+
+    async def test_subrectangle_escaping_its_tile_is_rejected(self):
+        fb = Framebuffer(16, 16)
+        # x=14 with w=4 runs past the 16-wide tile.
+        payload = bytearray()
+        payload.append(
+            proto.HEXTILE_ANY_SUBRECTS
+            | proto.HEXTILE_BACKGROUND_SPECIFIED
+            | proto.HEXTILE_FOREGROUND_SPECIFIED
+        )
+        payload += bgrx_pixels([(1, 1, 1)]) + bgrx_pixels([(2, 2, 2)])
+        payload.append(1)
+        payload.append((14 << 4) | 0)
+        payload.append(((4 - 1) << 4) | (4 - 1))
+        with pytest.raises(ProtocolError):
+            await decode_rect(
+                fb, rect_header(0, 0, 16, 16, ENCODING_HEXTILE) + bytes(payload)
+            )
+
+    async def test_qemu_screen_byte_stream_decodes_without_desync(self):
+        """A real QEMU 11.1 frame, byte for byte.
+
+        This is the regression test for the reported symptom: the client
+        completed the handshake and then never presented a frame, because the
+        sub-encoding mask was read as sequential identifiers. The payload below
+        is the first three tiles of an actual 1280x800 Hextile update --
+        a solid-background tile, a flags-0x00 tile, and a
+        SubrectsColoured tile with packed nibbles -- taken from the live VM.
+        """
+        fb = Framebuffer(48, 16)
+        payload = (
+            # flags 0x02: background specified, then one TPIXEL.
+            bytes((0x02,)) + bgrx_pixels([(10, 20, 30)])
+            # flags 0x00: nothing stated, so the carried background.
+            + bytes((0x00,))
+            # flags 0x18: AnySubrects + SubrectsColoured, one sub-rectangle
+            # whose colour precedes its packed x/y and (w-1)/(h-1) bytes.
+            + bytes((0x18,))
+            + bytes((0x01,))
+            + bgrx_pixels([(40, 50, 60)])
+            + bytes(((1 << 4) | 1, ((4 - 1) << 4) | (2 - 1)))
+        )
+        await decode_rect(fb, rect_header(0, 0, 48, 16, ENCODING_HEXTILE) + payload)
+        # Tile 0 and tile 1 are entirely the carried background.
+        assert bgra_at(fb, 0, 0) == (10, 20, 30)
+        assert bgra_at(fb, 31, 15) == (10, 20, 30)
+        # Tile 2's sub-rectangle is 4 wide and 2 tall, not 1x1 and not 4x2.
+        assert bgra_at(fb, 32, 0) == (10, 20, 30)
+        assert bgra_at(fb, 33, 1) == (40, 50, 60)
+        assert bgra_at(fb, 36, 2) == (40, 50, 60)
+        assert bgra_at(fb, 37, 1) == (10, 20, 30)
+        assert bgra_at(fb, 33, 3) == (10, 20, 30)
+
+    async def test_a_qemu_style_screen_of_many_tiles_stays_in_step(self):
+        """Every byte of the rectangle is consumed, and the last tile lands right.
+
+        Desynchronisation is the failure that matters: a decoder that reads the
+        wrong number of bytes still produces a plausible screen for a while.
+        This asserts the stream position and a pixel at the far corner, so a
+        one-byte drift anywhere in a hundred tiles fails here.
+        """
+        width, height = 16 * 8, 16 * 4
+        fb = Framebuffer(width, height)
+        tiles = bytearray()
+        expected = {}
+        for index in range(8 * 4):
+            tx = (index % 8) * 16
+            ty = (index // 8) * 16
+            if index % 3 == 0:
+                colour = (10 + index, 20, 30)
+                tiles += hextile_raw_tile(colour, 16, 16)
+                expected[(tx, ty)] = colour
+            elif index % 3 == 1:
+                colour = (40, 50 + index, 60)
+                tiles += hextile_tile(background=colour)
+                expected[(tx, ty)] = colour
+            else:
+                bg = (1, 1, 1)
+                fg = (70, 80, 90)
+                tiles += hextile_tile(
+                    background=bg, foreground=fg, subrects=[(2, 3, 5, 4)]
+                )
+                expected[(tx, ty)] = bg
+                expected[(tx + 2, ty + 3)] = fg
+                expected[(tx + 6, ty + 6)] = fg
+        leftover = await decode_rect_exact(
+            fb, rect_header(0, 0, width, height, ENCODING_HEXTILE) + bytes(tiles)
+        )
+        assert leftover == 0, f"{leftover} bytes of the rectangle were never read"
+        for (x, y), colour in expected.items():
+            assert bgra_at(fb, x, y) == colour, f"at ({x},{y})"
+        # Tile 31 is the last one written, so its colour landing at the bottom
+        # right corner proves every preceding tile was read at the right length
+        # and the stream is still in step at the far edge.
+        last = 8 * 4 - 1
+        assert expected[(last % 8 * 16, last // 8 * 16)] == bgra_at(
+            fb, width - 1, height - 1
+        )
 
 class TestTight:
     @staticmethod

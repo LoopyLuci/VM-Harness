@@ -400,27 +400,33 @@ SUPPORTED_ENCODINGS: tuple[int, ...] = (
 #:
 #: Deliberately *not* the same as :data:`SUPPORTED_ENCODINGS`. Tight is decodable
 #: and stays in that set, so a rectangle that arrives as Tight still renders; it
-#: is simply not advertised to QEMU, whose Tight framing this decoder cannot be
-#: made to agree with. Measured against QEMU 11.1 with a 1280x800,
-#: 32-bpp/depth-24 client format:
+#: is simply not advertised to QEMU. See the note below for what Tight would
+#: still cost.
 #:
-#: * a Tight rectangle whose control byte has bit 7 set carries **two** bytes of
-#:   pixel data, where the specification says a TPIXEL there is three (three is
-#:   correct for depth 24), and the following bytes only parse as a rectangle
-#:   header under the two-byte reading;
-#: * other rectangles carry control bytes of 0x60, whose compression field reads
-#:   as 2 -- PNG -- where the following bytes are a zlib stream.
+#: Hextile is advertised instead, and against QEMU 11.1 at 1280x800 with a
+#: 32-bpp/depth-24 client format it decodes a full non-incremental update
+#: byte-exactly: 66,627 bytes in, 66,627 consumed, and a framebuffer identical
+#: to a reference client's, pixel for pixel.
 #:
-#: Both readings are self-consistent enough to be tempting and both desynchronise
-#: the stream within a few rectangles, and RFB has no resynchronisation: once the
-#: byte offsets are wrong, every later rectangle is garbage and the session has to
-#: be torn down. So QEMU is offered Hextile instead, which is implemented, tested
-#: against real bytes, and is what most VNC clients end up using anyway.
+#: Tight is nonetheless *not* safe to advertise yet, and the reason is the
+#: decoder rather than the framing. Measured against the same VM, forcing
+#: ``encodings=(7,)`` connects fine and QEMU sends 48 rectangles that a
+#: spec-faithful decoder consumes exactly -- so the earlier claim on this
+#: comment that "QEMU's Tight framing this decoder cannot be made to agree
+#: with" was wrong, and so was the reading of the control byte as a compression
+#: method rather than as a flag mask. What the live bytes actually show is:
 #:
-#: This costs bandwidth on large repaints, not correctness or the property that
-#: matters here: QEMU still decides what changed and still sends only the damaged
-#: regions. Remove Tight from this tuple once QEMU's framing is understood --
-#: :func:`_decode_tight` is the only thing standing in the way.
+#: * QEMU's Tight zlib streams are **zlib-wrapped** (they start ``78 da``), not
+#:   raw DEFLATE, contradicting :func:`_inflate`'s comment;
+#: * the four streams are **persistent across rectangles**, reset only by the
+#:   control byte's low nibble, so a decoder that builds a fresh inflater per
+#:   rectangle fails on the second rectangle that uses a stream;
+#: * of QEMU's 48 rectangles, 29 are FillCompression, 13 are PaletteFilter and
+#:   5 are CopyFilter -- so :func:`_decode_tight` refuses two of every three.
+#:
+#: Fixing those is a separate change; until it lands, advertising Tight would
+#: end the session on the first PaletteFilter rectangle, which is strictly worse
+#: than the larger Hextile rectangles.
 ADVERTISED_ENCODINGS: tuple[int, ...] = (
     ENCODING_HEXTILE,
     ENCODING_RRE,
@@ -435,13 +441,29 @@ PSEUDO_DESKTOP_SIZE = ENCODING_DESKTOP_SIZE
 MAX_ENCODINGS = 1024
 MAX_RECT_ENCODINGS = 8
 
-# Hextile sub-encodings.
-HEXTILE_RAW = 0
-HEXTILE_BACKGROUND_SPECIFIED = 1
-HEXTILE_FOREGROUND_SPECIFIED = 2
-HEXTILE_ANY_SUBRECTS = 3
-HEXTILE_ALL_SUBRECTS = 4
+# Hextile sub-encoding mask. These are *bit* values, one per flag, not
+# sequential identifiers: a tile's flags byte is a mask and several are set at
+# once. QEMU 11.1 writes, for one screen, 0x00, 0x01, 0x02, 0x04, 0x06, 0x08,
+# 0x18 and 0x0f within a single rectangle, which is only self-consistent under
+# this reading. Reading them as 0/1/2/3/4 identifiers -- as this module
+# previously did -- makes 0x00 mean "Raw" when it means "nothing at all, the
+# whole tile is the carried background", and 0x02 mean "ForegroundSpecified"
+# when it means "BackgroundSpecified". Every rectangle desynchronises within a
+# few tiles and no frame is ever presented.
+HEXTILE_RAW = 0x01
+HEXTILE_BACKGROUND_SPECIFIED = 0x02
+HEXTILE_FOREGROUND_SPECIFIED = 0x04
+HEXTILE_ANY_SUBRECTS = 0x08
+HEXTILE_SUBRECTS_COLOURED = 0x10
+#: Bits a hextile flags byte may carry. Anything else (the ZRLE-era ZlibRaw and
+#: Zlib bits, 0x20 and 0x40) is a different encoding.
+HEXTILE_KNOWN_FLAGS = 0x1F
+#: Tile edge length in pixels. A tile is 16x16; only the rightmost column and
+#: bottom row of tiles may be smaller.
 HEXTILE_TILE = 16
+#: A tile's sub-rectangle count is one byte, so this is its ceiling. It is also
+#: a useful plausibility bound: a tile is at most 256 pixels.
+MAX_HEXTILE_SUBRECTS = 255
 
 # Tight filters.
 TIGHT_FILTER_COPY = 0
@@ -726,6 +748,10 @@ class AsyncByteReader:
     def __init__(self, data: bytes):
         self._data = data
         self._pos = 0
+
+    @property
+    def remaining(self) -> int:
+        return len(self._data) - self._pos
 
     async def read_exactly(self, count: int) -> bytes:
         # Delegating to ByteReader keeps the bounds rules in one place, so an
@@ -1014,22 +1040,40 @@ async def _decode_rre(fb: Framebuffer, rect: Rectangle, fmt: PixelFormat, source
 
 
 async def _decode_hextile(fb: Framebuffer, rect: Rectangle, fmt: PixelFormat, source: "AsyncByteReader") -> None:
-    """Hextile: a 16x16 grid of tiles, each raw or filled with two colours."""
+    """Hextile: a 16x16 grid of tiles, each raw or filled with two colours.
+
+    Each tile opens with a one-byte flags *mask* whose bits are
+    ``HEXTILE_*`` above, in this order on the wire: the flags byte, then the
+    background pixel if **BackgroundSpecified** is set, then the foreground
+    pixel if **ForegroundSpecified** is set, then -- if **AnySubrects** is set
+    -- a one-byte sub-rectangle count, then the sub-rectangles themselves.
+
+    Two carry rules from the specification are load-bearing, and getting either
+    wrong corrupts pixels rather than raising:
+
+    * the background may not be carried across a Raw tile, and the *first*
+      non-Raw tile of a rectangle must therefore state it;
+    * the foreground may not be carried across a Raw tile or across a tile that
+      carried **SubrectsColoured**, because a coloured sub-rectangle's own
+      colour is not the foreground.
+
+    QEMU relies on both: it tracks ``last_bg``/``last_fg`` and ``has_bg``/
+    ``has_fg`` in exactly this way, resetting ``has_fg`` after a
+    SubrectsColoured tile.
+    """
     pixels = _PixelReader(fmt)
     x, y, w, h = rect.x, rect.y, rect.width, rect.height
-    # Carried across tiles per the specification: a tile that states neither a
-    # background nor a foreground inherits the previous tile's background. A
-    # Raw tile clears it, because the specification says the carry does not
-    # survive a raw tile and getting that wrong shows up as one wrong row of a
-    # mostly-correct screen.
-    carried: Optional[bytes] = None
+    carried_background: Optional[bytes] = None
+    carried_foreground: Optional[bytes] = None
     for tile_y in range(0, h, HEXTILE_TILE):
         rows = min(HEXTILE_TILE, h - tile_y)
         for tile_x in range(0, w, HEXTILE_TILE):
             cols = min(HEXTILE_TILE, w - tile_x)
             ax, ay = x + tile_x, y + tile_y
-            subencoding = await source.read_u8()
-            if subencoding == HEXTILE_RAW:
+            flags = await source.read_u8()
+            if flags & ~HEXTILE_KNOWN_FLAGS:
+                raise ProtocolError(f"Hextile tile flags {flags:#04x} are not defined by Hextile")
+            if flags & HEXTILE_RAW:
                 _blit_raw(
                     fb,
                     ax,
@@ -1039,70 +1083,71 @@ async def _decode_hextile(fb: Framebuffer, rect: Rectangle, fmt: PixelFormat, so
                     await source.read_exactly(cols * rows * fmt.bytes_per_pixel),
                     fmt,
                 )
-                carried = None
+                carried_background = None
+                carried_foreground = None
                 continue
-            background = carried
-            if subencoding & 0x01:
-                background = await _read_pixel(source, pixels)
-            if background is None:
+            if flags & HEXTILE_BACKGROUND_SPECIFIED:
+                carried_background = await _read_pixel(source, pixels)
+            if carried_background is None:
                 raise ProtocolError("Hextile tile inherits a background from no previous tile")
-            carried = background
-            if subencoding & 0x02:
-                foreground = await _read_pixel(source, pixels)
-            else:
-                foreground = None
-            fb.fill_rect(ax, ay, cols, rows, background)
-            if foreground is None:
-                continue
-            if subencoding == HEXTILE_ALL_SUBRECTS:
-                await _decode_hextile_all_subrects(fb, ax, ay, cols, rows, foreground, source)
-            elif subencoding == HEXTILE_ANY_SUBRECTS:
-                while True:
-                    sx = await source.read_u8()
-                    if sx == 0:
-                        break
-                    sy = await source.read_u8()
-                    sw = await source.read_u8()
-                    sh = await source.read_u8()
-                    if sw == 0 or sh == 0 or sx + sw > cols or sy + sh > rows:
-                        raise ProtocolError(f"Hextile sub-rectangle escapes its {cols}x{rows} tile")
-                    fb.fill_rect(ax + sx, ay + sy, sw, sh, foreground)
-            else:
-                # Sub-encodings 5..15 mean "the last n sub-rectangles"; bit 4 set
-                # means the same thing with the count in the low nibble.
-                for _ in range(subencoding & 0x0F):
-                    sx = await source.read_u8()
-                    sy = await source.read_u8()
-                    sw = await source.read_u8()
-                    sh = await source.read_u8()
-                    if sw == 0 or sh == 0 or sx + sw > cols or sy + sh > rows:
-                        raise ProtocolError(f"Hextile sub-rectangle escapes its {cols}x{rows} tile")
-                    fb.fill_rect(ax + sx, ay + sy, sw, sh, foreground)
+            if flags & HEXTILE_FOREGROUND_SPECIFIED:
+                carried_foreground = await _read_pixel(source, pixels)
+            coloured = bool(flags & HEXTILE_SUBRECTS_COLOURED)
+            fb.fill_rect(ax, ay, cols, rows, carried_background)
+            count = await source.read_u8() if flags & HEXTILE_ANY_SUBRECTS else 0
+            if count > MAX_HEXTILE_SUBRECTS:
+                raise ProtocolError(f"Hextile tile claims {count} sub-rectangles")
+            for _ in range(count):
+                if coloured:
+                    # SubrectsColoured: the colour precedes the coordinates and
+                    # is not the tile's foreground.
+                    foreground = await _read_pixel(source, pixels)
+                else:
+                    if carried_foreground is None:
+                        raise ProtocolError(
+                            "Hextile tile has sub-rectangles but inherits a foreground "
+                            "from no previous tile"
+                        )
+                    foreground = carried_foreground
+                await _read_hextile_subrect(fb, ax, ay, cols, rows, foreground, source)
+            if coloured:
+                # A coloured sub-rectangle does not establish a foreground.
+                carried_foreground = None
 
 
-async def _decode_hextile_all_subrects(
-    fb: Framebuffer, ax: int, ay: int, cols: int, rows: int, foreground: bytes, source: "AsyncByteReader"
+async def _read_hextile_subrect(
+    fb: Framebuffer,
+    ax: int,
+    ay: int,
+    cols: int,
+    rows: int,
+    foreground: bytes,
+    source: "AsyncByteReader",
 ) -> None:
-    """Hextile sub-encoding 4: a bitmask, one bit per sub-rectangle.
+    """Read one Hextile sub-rectangle and paint it.
 
-    Bits run low to high across the bytes; a zero byte ends the tile. This form
-    is never emitted by the server this client talks to, but it is part of the
-    encoding and another server may send it.
+    Two bytes carry it, and both are packed nibbles: the first is
+    ``x << 4 | y`` and the second is ``(w - 1) << 4 | (h - 1)``.
+
+    The ``- 1`` is the part that is invisible until it is fatal. Storing the
+    extents verbatim reads a one-pixel-tall run as zero pixels, which is not
+    detectable as an error -- ``fill_rect`` would be handed a zero height and
+    the stream position would still be right, so the frame decodes to a screen
+    with invisible scanlines and no diagnostic anywhere. QEMU's
+    ``hextile_enc_cord`` writes ``(w - 1) & 0x0F`` and ``(h - 1) & 0x0F``,
+    which is what makes a full 16-wide tile encode as ``0x0F`` rather than
+    ``0x10``, and the nibble range is 0..15 -- so a width of 16 arrives as 15
+    and has to be incremented back.
     """
-    while True:
-        bits = await source.read_u8()
-        if bits == 0:
-            return
-        for bit in range(8):
-            if not bits & (1 << bit):
-                continue
-            sx = await source.read_u8()
-            sy = await source.read_u8()
-            sw = await source.read_u8()
-            sh = await source.read_u8()
-            if sw == 0 or sh == 0 or sx + sw > cols or sy + sh > rows:
-                raise ProtocolError(f"Hextile sub-rectangle escapes its {cols}x{rows} tile")
-            fb.fill_rect(ax + sx, ay + sy, sw, sh, foreground)
+    xy = await source.read_u8()
+    wh = await source.read_u8()
+    sx, sy = xy >> 4, xy & 0x0F
+    sw, sh = (wh >> 4) + 1, (wh & 0x0F) + 1
+    if sx + sw > cols or sy + sh > rows:
+        raise ProtocolError(
+            f"Hextile sub-rectangle ({sx},{sy}) {sw}x{sh} escapes its {cols}x{rows} tile"
+        )
+    fb.fill_rect(ax + sx, ay + sy, sw, sh, foreground)
 
 
 async def _read_tight_compact_length(source: "AsyncByteReader") -> int:
