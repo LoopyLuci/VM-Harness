@@ -470,6 +470,11 @@ TIGHT_FILTER_COPY = 0
 TIGHT_FILTER_PALETTE = 1
 TIGHT_FILTER_GRADIENT = 2
 
+#: Filtered data smaller than this is sent uncompressed, with no length prefix.
+#: Twelve bytes, matching aurora-vnc and the RFB Tight specification. Reading a
+#: compact length where there is none eats the first byte of pixel data.
+TIGHT_MIN_TO_COMPRESS = 12
+
 
 def encoding_name(encoding: int) -> str:
     return {
@@ -1212,11 +1217,19 @@ async def _decode_tight(fb: Framebuffer, rect: Rectangle, fmt: PixelFormat, sour
         raise UnsupportedEncoding(f"Tight compression type {kind:#x} is not defined")
     # bit 6 is the explicit-filter flag, not part of the compression type.
     filter_id = await source.read_u8() if kind & 0x04 else TIGHT_FILTER_COPY
+    tpixel_size = _tight_tpixel_size(fmt)
+    palette: Optional[list[tuple[int, int, int, int]]] = None
     if filter_id == TIGHT_FILTER_PALETTE:
-        raise UnsupportedEncoding("Tight PaletteFilter is not yet decoded")
+        # A one-byte count *minus one*, then that many TPIXELs. The palette is
+        # sent in the clearstream, never through a zlib stream.
+        colours = await source.read_u8() + 1
+        palette = [
+            _tight_tpixel_to_bgra(bytes(await source.read_exactly(tpixel_size)), tpixel_size, fmt)
+            for _ in range(colours)
+        ]
     if filter_id == TIGHT_FILTER_GRADIENT:
         raise UnsupportedEncoding("Tight GradientFilter is not yet decoded")
-    if filter_id != TIGHT_FILTER_COPY:
+    if filter_id not in (TIGHT_FILTER_COPY, TIGHT_FILTER_PALETTE):
         raise UnsupportedEncoding(f"Tight filter {filter_id} is not known")
     # Bits 5-4 are the zlib *stream id*, not a compression method: kind 1 is
     # BasicCompression on stream 1, which is most of what a conformant server
@@ -1227,9 +1240,49 @@ async def _decode_tight(fb: Framebuffer, rect: Rectangle, fmt: PixelFormat, sour
     # rectangle. It has to be applied before the stream is touched, or a
     # rectangle that resets stream 0 reads the tail of the previous one.
     reset_tight_streams(control & 0x0F)
-    length = await _read_tight_compact_length(source)
-    payload = await source.read_exactly(length)
-    _decode_tight_pixels(fb, rect, fmt, _inflate(stream, payload, rect, fmt))
+    expected = _tight_raw_length(rect, filter_id, palette, tpixel_size)
+    if expected < TIGHT_MIN_TO_COMPRESS:
+        # Too small to be worth compressing, and the specification says so: sent
+        # as-is with no compact length at all. Reading a length here eats the
+        # first byte of the pixel data.
+        data = await source.read_exactly(expected)
+    else:
+        length = await _read_tight_compact_length(source)
+        if length > MAX_TIGHT_DECOMPRESSED_BYTES:
+            raise ProtocolError(
+                f"Tight length {length} is beyond the "
+                f"{MAX_TIGHT_DECOMPRESSED_BYTES} byte limit"
+            )
+        data = _inflate_stream(stream, await source.read_exactly(length), expected)
+    if len(data) != expected:
+        raise ProtocolError(
+            f"Tight rectangle carried {len(data)} bytes, expected {expected}"
+        )
+    if palette is not None:
+        _decode_tight_palette(fb, rect, data, palette)
+    else:
+        _decode_tight_pixels(fb, rect, fmt, data)
+
+
+def _tight_raw_length(
+    rect: Rectangle,
+    filter_id: int,
+    palette: Optional[list[tuple[int, int, int, int]]],
+    tpixel_size: int,
+) -> int:
+    """Bytes of filtered data a rectangle carries once the filter is applied.
+
+    The two-colour palette is the awkward one: one bit per pixel, with each row
+    padded to a whole number of bytes. Computing the length from the rectangle
+    instead of from the bytes that arrived is what makes that padding
+    predictable -- and getting it wrong desynchronises the stream from that
+    rectangle onwards, since RFB has no resynchronisation.
+    """
+    count = rect.width * rect.height
+    if filter_id == TIGHT_FILTER_PALETTE and palette is not None:
+        return rect.height * ((rect.width + 7) // 8) if len(palette) <= 2 else count
+    # CopyFilter and GradientFilter carry one whole TPIXEL per pixel.
+    return count * tpixel_size
 
 
 #: The four zlib streams a Tight connection carries for its whole life.
@@ -1254,7 +1307,70 @@ def reset_tight_streams(mask: int) -> None:
             _TIGHT_STREAMS[index] = None
 
 
-def _inflate(stream: int, payload: bytes, rect: Rectangle, fmt: PixelFormat) -> bytes:
+def _tight_tpixel_to_bgra(
+    pixel: bytes, tpixel_size: int, fmt: PixelFormat
+) -> tuple[int, int, int, int]:
+    """One Tight TPIXEL as (b, g, r, a) for the framebuffer.
+
+    A TPIXEL is three bytes in R, G, B order for a 32bpp/24-depth format, and
+    one whole pixel (two bytes for RGB555) for everything else.
+    """
+    if tpixel_size == 3:
+        r, g, b = pixel[0], pixel[1], pixel[2]
+        return (b, g, r, 0xFF)
+    reader = _PixelReader(fmt)
+    data = reader.pixel_to_bgra(0, pixel)
+    return (data[0], data[1], data[2], data[3])
+
+
+def _decode_tight_palette(
+    fb: Framebuffer,
+    rect: Rectangle,
+    data: bytes,
+    palette: list[tuple[int, int, int, int]],
+) -> None:
+    """Paint a PaletteFilter rectangle.
+
+    One or two colours are one bit per pixel, with each row padded out to a
+    whole number of bytes -- the padding is why the payload length has to be
+    computed from the rectangle rather than read off the wire. Three or more
+    colours are one index byte per pixel, tightly packed with no padding.
+
+    An index outside the palette is refused rather than clamped: it means the
+    stream is desynchronised, and painting an arbitrary colour would hide that
+    for the rest of the session instead of ending it.
+    """
+    stride = fb.width * 4
+    count = rect.width * rect.height
+    if len(palette) <= 2:
+        row_bytes = (rect.width + 7) // 8
+        for line in range(rect.height):
+            base = line * row_bytes
+            d = (rect.y + line) * stride + rect.x * 4
+            for col in range(rect.width):
+                byte = data[base + (col >> 3)]
+                index = (byte >> (7 - (col & 7))) & 1
+                b, g, r, a = palette[index]
+                fb.data[d + col * 4:d + col * 4 + 4] = bytes((b, g, r, a))
+    else:
+        if len(data) != count:
+            raise ProtocolError(
+                f"Tight palette indices are {len(data)} bytes, expected {count}"
+            )
+        limit = len(palette)
+        for index in range(count):
+            value = data[index]
+            if value >= limit:
+                raise ProtocolError(
+                    f"Tight palette index {value} is outside a {limit}-colour palette"
+                )
+            line, col = divmod(index, rect.width)
+            b, g, r, a = palette[value]
+            d = (rect.y + line) * stride + rect.x + col
+            fb.data[d * 4:d * 4 + 4] = bytes((b, g, r, a))
+
+
+def _inflate_stream(stream: int, payload: bytes, expected: int) -> bytes:
     """Inflate one Tight rectangle from its persistent zlib stream.
 
     **zlib framing, not raw DEFLATE.** Tight's BasicCompression carries a
@@ -1278,11 +1394,6 @@ def _inflate(stream: int, payload: bytes, rect: Rectangle, fmt: PixelFormat) -> 
         raise ProtocolError(
             f"Tight zlib stream {stream} expands past the "
             f"{MAX_TIGHT_DECOMPRESSED_BYTES} byte limit"
-        )
-    expected = rect.width * rect.height * _tight_tpixel_size(fmt)
-    if len(raw) != expected:
-        raise ProtocolError(
-            f"Tight rectangle inflated to {len(raw)} bytes, expected {expected}"
         )
     return raw
 

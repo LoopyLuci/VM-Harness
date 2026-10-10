@@ -1051,6 +1051,12 @@ class TestTight:
         decoder was written to match it.
         """
         compressed = zlib.compress(raw, 9)
+        # Under the threshold the specification says send the filtered data
+        # as-is, with no compact length at all -- and reading a length there
+        # eats the first byte of pixel data. Building the fixture without this
+        # branch tests a framing QEMU does not send for small rectangles.
+        if len(raw) < proto.TIGHT_MIN_TO_COMPRESS:
+            return b"\x01" + raw
         if len(compressed) <= 127:
             length = bytes((len(compressed),))
         elif len(compressed) <= 16383:
@@ -1147,6 +1153,38 @@ class TestTight:
         # of 0x11 is BasicCompression on stream 1 and must *not* be refused.
         with pytest.raises(UnsupportedEncoding):
             await decode_rect(fb, rect_header(0, 0, 2, 2, ENCODING_TIGHT) + b"\x90\x00")
+
+    async def test_a_palette_rectangle_decodes(self):
+        """Three or more colours: one tightly packed index byte per pixel."""
+        fb = Framebuffer(4, 2)
+        # 0x45: bit 6 set so a filter-id byte follows, filter 1 = PaletteFilter,
+        # bits 5-4 = 0 so zlib stream 0, bit 0 set to reset it.
+        red, green = bytes((10, 20, 30)), bytes((40, 50, 60))
+        # Two colours pack one bit per pixel, so 4x2 is one byte per row: two
+        # bytes total. Row 0 = R,G,G,R (0b10100000), row 1 = G,R,R,G
+        # (0b01000000). Under the 12-byte threshold, so sent with no length.
+        payload = b"\x45\x01" + bytes((1,)) + red + green + bytes((0b10100000, 0b01000000))
+        await decode_rect(fb, rect_header(0, 0, 4, 2, ENCODING_TIGHT) + payload)
+        # Bits run left to right, most significant bit first, so
+        # row 0 = 0b10100000 -> G R G R and row 1 = 0b01000000 -> R G R R.
+        # Index 0 is the first palette entry, index 1 the second.
+        assert [bgra_at(fb, x, 0) for x in range(4)] == [
+            (40, 50, 60), (10, 20, 30), (40, 50, 60), (10, 20, 30)
+        ]
+        assert [bgra_at(fb, x, 1) for x in range(4)] == [
+            (10, 20, 30), (40, 50, 60), (10, 20, 30), (10, 20, 30)
+        ]
+
+    async def test_a_palette_index_outside_the_palette_is_refused(self):
+        """An out-of-range index means the stream is desynchronised.
+
+        Painting an arbitrary colour instead would hide the desync for the rest
+        of the session rather than ending it.
+        """
+        fb = Framebuffer(4, 1)
+        payload = b"\x45" + bytes((0,)) + bytes((10, 20, 30)) + bytes((9, 9, 9))
+        with pytest.raises(ProtocolError):
+            await decode_rect(fb, rect_header(0, 0, 4, 1, ENCODING_TIGHT) + payload)
 
     async def test_gradient_filter_is_refused(self):
         fb = Framebuffer(2, 2)
