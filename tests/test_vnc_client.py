@@ -1042,8 +1042,15 @@ class TestTight:
         filter-id byte follows and CopyFilter is implied, bit 0 set so the
         decoder resets the zlib stream. Then the one-to-three byte compact
         length, then a complete zlib stream.
+
+        The stream is **zlib-wrapped**, not raw DEFLATE. Tight's
+        BasicCompression carries the same framing `zlib.compress` produces: a
+        two-byte header and an Adler-32 trailer. QEMU's VNC server sends them
+        -- its streams begin `78 da` -- so a fixture built with raw DEFLATE
+        tests a framing no real server produces, and passes only because the
+        decoder was written to match it.
         """
-        compressed = _raw_deflate(raw)
+        compressed = zlib.compress(raw, 9)
         if len(compressed) <= 127:
             length = bytes((len(compressed),))
         elif len(compressed) <= 16383:
@@ -1135,8 +1142,11 @@ class TestTight:
 
     async def test_jpeg_and_png_compression_are_refused(self):
         fb = Framebuffer(2, 2)
+        # 0x90: bits 6-4 = 0b1001, i.e. compression type 9 = JPEG. Bits 5-4
+        # are the zlib stream id, not a compression method, so a control byte
+        # of 0x11 is BasicCompression on stream 1 and must *not* be refused.
         with pytest.raises(UnsupportedEncoding):
-            await decode_rect(fb, rect_header(0, 0, 2, 2, ENCODING_TIGHT) + b"\x11\x00")
+            await decode_rect(fb, rect_header(0, 0, 2, 2, ENCODING_TIGHT) + b"\x90\x00")
 
     async def test_gradient_filter_is_refused(self):
         fb = Framebuffer(2, 2)
@@ -1149,7 +1159,9 @@ class TestTight:
     async def test_explicit_copy_filter_byte_is_accepted(self):
         fb = Framebuffer(2, 2)
         raw = b"".join(bytes((1, 2, 3)) for _ in range(4))
-        compressed = _raw_deflate(raw)
+        # 0x41: bit 6 set so an explicit filter-id byte follows, and that byte
+        # is 0 (CopyFilter). zlib-wrapped, as QEMU sends it.
+        compressed = zlib.compress(raw, 9)
         payload = b"\x41\x00" + bytes((len(compressed),)) + compressed
         await decode_rect(fb, rect_header(0, 0, 2, 2, ENCODING_TIGHT) + payload)
         assert bgra_at(fb, 0, 0) == (1, 2, 3)

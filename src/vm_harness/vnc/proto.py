@@ -1192,59 +1192,97 @@ async def _decode_tight(fb: Framebuffer, rect: Rectangle, fmt: PixelFormat, sour
     trail or a cleared menu was enough to kill the console.
     """
     control = await source.read_u8()
-    if control & 0x80:
+    # The compression type is bits 6-4 of the whole byte -- mask *after* the
+    # shift, never before, or Fill (0x8) and JPEG (0x9) both lose bit 3 and
+    # become indistinguishable.
+    kind = control >> 4
+    if kind == 0x08:
         # FillCompression: no compression id, no filter byte, no zlib stream --
-        # just one TPIXEL that covers the entire rectangle. Everything else in
-        # the control byte is ignored, per the specification.
+        # just one TPIXEL covering the entire rectangle.
         tpixel_size = _tight_tpixel_size(fmt)
         _fill_tight_pixel(fb, rect, fmt, await source.read_exactly(tpixel_size))
         return
-    compression = (control >> 4) & 0x03
-    if compression != 0:
-        names = {1: "JPEG", 2: "PNG", 3: "ZRLE/Tight"}
+    if kind == 0x09:
         raise UnsupportedEncoding(
-            f"Tight {names.get(compression, compression)} compression is not supported "
-            "(only BasicCompression with zlib is decoded)"
+            "Tight JPEG compression is not decoded; this client never requests a "
+            "lossy session, so a peer selecting it is not honouring the encodings "
+            "we advertised"
         )
-    # Bit 6 clear means no filter-id byte follows and CopyFilter is implied.
-    # This is the bit that is easy to get backwards: reading a filter byte that
-    # was never sent eats the first byte of the compact length.
-    if control & 0x40:
-        filter_id = await source.read_u8()
-        if filter_id == TIGHT_FILTER_PALETTE:
-            raise UnsupportedEncoding(
-                "Tight PaletteFilter is not supported (its palette framing is the "
-                "one part of Tight that implementations disagree about)"
-            )
-        if filter_id == TIGHT_FILTER_GRADIENT:
-            raise UnsupportedEncoding(
-                "Tight GradientFilter is not supported (only CopyFilter is decoded)"
-            )
-        if filter_id != TIGHT_FILTER_COPY:
-            raise UnsupportedEncoding(f"Tight filter {filter_id} is not known")
+    if kind & 0x08:
+        raise UnsupportedEncoding(f"Tight compression type {kind:#x} is not defined")
+    # bit 6 is the explicit-filter flag, not part of the compression type.
+    filter_id = await source.read_u8() if kind & 0x04 else TIGHT_FILTER_COPY
+    if filter_id == TIGHT_FILTER_PALETTE:
+        raise UnsupportedEncoding("Tight PaletteFilter is not yet decoded")
+    if filter_id == TIGHT_FILTER_GRADIENT:
+        raise UnsupportedEncoding("Tight GradientFilter is not yet decoded")
+    if filter_id != TIGHT_FILTER_COPY:
+        raise UnsupportedEncoding(f"Tight filter {filter_id} is not known")
+    # Bits 5-4 are the zlib *stream id*, not a compression method: kind 1 is
+    # BasicCompression on stream 1, which is most of what a conformant server
+    # sends. Treating anything but 0 as a different compression method refuses
+    # three quarters of the rectangles on the wire.
+    stream = kind & 0x03
+    # Bits 3-0 are a bitmask of streams the server reset before this
+    # rectangle. It has to be applied before the stream is touched, or a
+    # rectangle that resets stream 0 reads the tail of the previous one.
+    reset_tight_streams(control & 0x0F)
     length = await _read_tight_compact_length(source)
     payload = await source.read_exactly(length)
-    _decode_tight_pixels(fb, rect, fmt, _inflate(payload))
+    _decode_tight_pixels(fb, rect, fmt, _inflate(stream, payload, rect, fmt))
 
 
-def _inflate(payload: bytes) -> bytes:
-    """Inflate a Tight payload, refusing to expand without bound.
+#: The four zlib streams a Tight connection carries for its whole life.
+#:
+#: Persistent by design, not an optimisation. Tight's four streams exist so that
+#: a rectangle that repeats content already sent on the same stream can be
+#: encoded as a back-reference; a fresh inflater per rectangle cannot read the
+#: second rectangle that uses a stream. The server resets a stream by setting the
+#: matching bit in the control byte's low nibble, which is what `reset` does.
+_TIGHT_STREAMS: list[Optional["zlib._Decompress"]] = [None, None, None, None]
 
-    Tight's BasicCompression is **raw DEFLATE** (RFC 1951), not a zlib-wrapped
-    stream: there is no two-byte header and no Adler-32 trailer. That distinction
-    is invisible until it is fatal -- QEMU's VNC server sends raw deflate, so a
-    decoder using zlib's default framing fails with "incorrect header check" on
-    the first Tight rectangle it inflates, which on a live session reads as a
-    corrupt stream rather than as the wrong framing.
+
+def reset_tight_streams(mask: int) -> None:
+    """Drop the streams whose reset bit is set in `mask`.
+
+    `mask` is the control byte's low nibble, a *bitmask*: bit 0 resets stream
+    0, bit 1 resets stream 1, and so on. It is not a stream index -- reading it
+    as one resets the wrong stream and desynchronises everything after it.
     """
-    decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
+    for index in range(4):
+        if mask & (1 << index):
+            _TIGHT_STREAMS[index] = None
+
+
+def _inflate(stream: int, payload: bytes, rect: Rectangle, fmt: PixelFormat) -> bytes:
+    """Inflate one Tight rectangle from its persistent zlib stream.
+
+    **zlib framing, not raw DEFLATE.** Tight's BasicCompression carries a
+    zlib-wrapped stream: a two-byte header and an Adler-32 trailer, exactly as
+    `zlib.compress` produces. QEMU sends them, beginning `78 da`. Inflating
+    with `-MAX_WBITS` fails with "incorrect header check" on the first
+    rectangle, which reads as a corrupt stream rather than as wrong framing.
+
+    The decompressor is kept across rectangles because the stream is. A decoder
+    that builds one per rectangle fails on the second rectangle that uses it.
+    """
+    decompressor = _TIGHT_STREAMS[stream]
+    if decompressor is None:
+        decompressor = zlib.decompressobj()
+        _TIGHT_STREAMS[stream] = decompressor
     try:
         raw = decompressor.decompress(payload, MAX_TIGHT_DECOMPRESSED_BYTES)
     except zlib.error as exc:
-        raise ProtocolError(f"Tight DEFLATE stream is corrupt: {exc}") from exc
+        raise ProtocolError(f"Tight zlib stream {stream} is corrupt: {exc}") from exc
     if decompressor.unconsumed_tail:
         raise ProtocolError(
-            f"Tight DEFLATE stream expands past the {MAX_TIGHT_DECOMPRESSED_BYTES} byte limit"
+            f"Tight zlib stream {stream} expands past the "
+            f"{MAX_TIGHT_DECOMPRESSED_BYTES} byte limit"
+        )
+    expected = rect.width * rect.height * _tight_tpixel_size(fmt)
+    if len(raw) != expected:
+        raise ProtocolError(
+            f"Tight rectangle inflated to {len(raw)} bytes, expected {expected}"
         )
     return raw
 
