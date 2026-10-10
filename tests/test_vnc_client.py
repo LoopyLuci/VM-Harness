@@ -1186,13 +1186,38 @@ class TestTight:
         with pytest.raises(ProtocolError):
             await decode_rect(fb, rect_header(0, 0, 4, 1, ENCODING_TIGHT) + payload)
 
-    async def test_gradient_filter_is_refused(self):
-        fb = Framebuffer(2, 2)
-        # bit 6 set, then a filter-id byte of 2 (GradientFilter).
-        with pytest.raises(UnsupportedEncoding):
-            await decode_rect(
-                fb, rect_header(0, 0, 2, 2, ENCODING_TIGHT) + b"\x41" + bytes((2,)) + b"\x00"
-            )
+    async def test_gradient_filter_predicts_from_its_neighbours(self):
+        """Hand-computed, because a wrong sweep order smears rather than raises.
+
+        A GradientFilter pixel is a difference from `left + above - above_left`,
+        so the very first pixel has nothing to predict from and is its own
+        value. Getting the row order or the neighbour choice wrong produces a
+        plausible-looking picture with the error smeared across each row, which
+        a round-trip test against the decoder's own output would not catch.
+        """
+        # A 1x3 row, so every prediction comes from the pixel to the left.
+        # GradientFilter is differential: a pixel is `prediction + difference`,
+        # not a colour. So the differences below are chosen so the *sum* is the
+        # colour asserted afterwards.
+        #
+        # (0,0) has no neighbour, so its prediction is 0 and the difference is
+        # the value: red.
+        # (1,0) predicts left = red, so to land on green the difference is
+        # (0 - 255, 255 - 0, 0 - 0) = (1, 255, 0) modulo 256.
+        # (2,0) predicts left = green, so to land on blue the difference is
+        # (0 - 0, 0 - 255, 255 - 0) = (0, 1, 255).
+        #
+        # 3 pixels x 3 bytes = 9, which is below the threshold, so it is sent
+        # uncompressed with no length prefix.
+        raw = bytes((255, 0, 0)) + bytes((1, 255, 0)) + bytes((0, 1, 255))
+
+        # 0x45: bit 6 set, filter 2 = GradientFilter, stream 0, reset bit 0.
+        payload = b"\x45\x02" + raw
+        fb = Framebuffer(3, 1)
+        await decode_rect(fb, rect_header(0, 0, 3, 1, ENCODING_TIGHT) + payload)
+        assert bgra_at(fb, 0, 0) == (255, 0, 0), "no neighbour, so the difference is the value"
+        assert bgra_at(fb, 1, 0) == (0, 255, 0), "predicted red plus the difference gives green"
+        assert bgra_at(fb, 2, 0) == (0, 0, 255), "predicted green plus the difference gives blue"
 
     async def test_explicit_copy_filter_byte_is_accepted(self):
         fb = Framebuffer(2, 2)
@@ -1242,7 +1267,7 @@ class TestUnknownEncoding:
         count = struct.unpack(">H", payload[2:4])[0]
         assert count == len(proto.ADVERTISED_ENCODINGS)
         listed = [struct.unpack(">i", payload[4 + i * 4:8 + i * 4])[0] for i in range(count)]
-        assert listed == [5, 2, 1, 0]
+        assert listed == [7, 5, 2, 1, 0]
         assert ENCODING_DESKTOP_SIZE not in listed  # sent separately
 
 

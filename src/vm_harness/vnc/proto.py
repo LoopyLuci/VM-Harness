@@ -427,7 +427,23 @@ SUPPORTED_ENCODINGS: tuple[int, ...] = (
 #: Fixing those is a separate change; until it lands, advertising Tight would
 #: end the session on the first PaletteFilter rectangle, which is strictly worse
 #: than the larger Hextile rectangles.
+#: What is offered to QEMU in ``SetEncodings``.
+#:
+#: Tight is first because it is the best compression QEMU offers and the
+#: decoder now handles every shape it sends: FillCompression, BasicCompression
+#: with zlib, and the Copy, Palette and Gradient filters, across all four
+#: persistent zlib streams with their reset mask. It was excluded for most of
+#: this file's life on the belief that QEMU's Tight framing could not be
+#: agreed with; that was a misdiagnosis, and the real gaps were a masked control
+#: byte, raw-DEFLATE inflation of zlib-wrapped streams, and no stream state at
+#: all. Verified live against a guest that sends PaletteFilter for 13 of its 48
+#: rectangles.
+#:
+#: Hextile and RRE stay advertised as fallbacks, not because Tight is doubtful
+#: but because a client that offers only Tight cannot fall back to anything a
+#: server without Tight would send.
 ADVERTISED_ENCODINGS: tuple[int, ...] = (
+    ENCODING_TIGHT,
     ENCODING_HEXTILE,
     ENCODING_RRE,
     ENCODING_COPY_RECT,
@@ -1228,8 +1244,8 @@ async def _decode_tight(fb: Framebuffer, rect: Rectangle, fmt: PixelFormat, sour
             for _ in range(colours)
         ]
     if filter_id == TIGHT_FILTER_GRADIENT:
-        raise UnsupportedEncoding("Tight GradientFilter is not yet decoded")
-    if filter_id not in (TIGHT_FILTER_COPY, TIGHT_FILTER_PALETTE):
+        pass  # decoded below; it needs the same length treatment as CopyFilter
+    elif filter_id not in (TIGHT_FILTER_COPY, TIGHT_FILTER_PALETTE):
         raise UnsupportedEncoding(f"Tight filter {filter_id} is not known")
     # Bits 5-4 are the zlib *stream id*, not a compression method: kind 1 is
     # BasicCompression on stream 1, which is most of what a conformant server
@@ -1260,6 +1276,8 @@ async def _decode_tight(fb: Framebuffer, rect: Rectangle, fmt: PixelFormat, sour
         )
     if palette is not None:
         _decode_tight_palette(fb, rect, data, palette)
+    elif filter_id == TIGHT_FILTER_GRADIENT:
+        _decode_tight_gradient(fb, rect, fmt, data, tpixel_size)
     else:
         _decode_tight_pixels(fb, rect, fmt, data)
 
@@ -1368,6 +1386,70 @@ def _decode_tight_palette(
             b, g, r, a = palette[value]
             d = (rect.y + line) * stride + rect.x + col
             fb.data[d * 4:d * 4 + 4] = bytes((b, g, r, a))
+
+
+def _decode_tight_gradient(
+    fb: Framebuffer, rect: Rectangle, fmt: PixelFormat, raw: bytes, tpixel_size: int
+) -> None:
+    """Paint a GradientFilter rectangle.
+
+    Each pixel is not a colour but a *difference* from a prediction built from
+    its neighbours: `left + above - above-left`, per component, clamped to the
+    component's range. The prediction is deliberately the same for every pixel
+    in the row-major sweep -- it uses the pixel already reconstructed to the
+    left on the current row, and the previous row's already-reconstructed
+    values above -- so this cannot be parallelised within a row.
+
+    Getting the order wrong is not a crash: the first pixel of every row is
+    predicted from nothing and decoded correctly, and the error then propagates
+    across the row as a smear. That is why this is worth testing against
+    hand-computed values rather than only against a round trip.
+
+    A 32bpp/24-depth TPIXEL is an R,G,B triple, so its components sit at shifts
+    16/8/0 in a 0x00RRGGBB word. Any other TPIXEL is a whole pixel in the
+    server's own layout, so its shifts and maxima come from the format.
+    """
+    if tpixel_size == 3:
+        shifts = (16, 8, 0)
+        maxes = (255, 255, 255)
+    else:
+        shifts = (fmt.red_shift, fmt.green_shift, fmt.blue_shift)
+        maxes = (fmt.red_max, fmt.green_max, fmt.blue_max)
+    reader = _PixelReader(fmt)
+    stride = fb.width * 4
+    width, height = rect.width, rect.height
+
+    previous = [0] * width
+    current = [0] * width
+    for row in range(height):
+        for col in range(width):
+            offset = (row * width + col) * tpixel_size
+            pixel = raw[offset:offset + tpixel_size]
+            if tpixel_size == 3:
+                diff = (pixel[0] << 16) | (pixel[1] << 8) | pixel[2]
+            else:
+                diff = int.from_bytes(pixel, reader.order)
+            value = 0
+            for component, (shift, maximum) in enumerate(zip(shifts, maxes)):
+                left = ((current[col - 1] >> shift) & maximum) if col > 0 else 0
+                above = ((previous[col] >> shift) & maximum) if row > 0 else 0
+                upper_left = (
+                    ((previous[col - 1] >> shift) & maximum) if col > 0 and row > 0 else 0
+                )
+                predicted = left + above - upper_left
+                predicted = 0 if predicted < 0 else min(predicted, maximum)
+                value |= (predicted + ((diff >> shift) & maximum) & maximum) << shift
+            current[col] = value
+        base = (rect.y + row) * stride + rect.x * 4
+        for col in range(width):
+            value = current[col]
+            if tpixel_size == 3:
+                bgra = bytes((value & 0xFF, (value >> 8) & 0xFF, (value >> 16) & 0xFF, 0xFF))
+            else:
+                bgra = reader.pixel_int_to_bgra(value)
+            offset = base + col * 4
+            fb.data[offset:offset + 4] = bgra
+        previous, current = current, previous
 
 
 def _inflate_stream(stream: int, payload: bytes, expected: int) -> bytes:
