@@ -6,10 +6,11 @@ quick action buttons, and recent activity log.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from gui.theme import T
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -19,6 +20,40 @@ from PyQt5.QtWidgets import (
 from gui.widgets import Card, StatusIndicator
 from gui.qmp_extractor import QMPExtractor
 
+log = logging.getLogger("vmharness.gui.dashboard")
+
+
+class _HubVMActionWorker(QThread):
+    completed = pyqtSignal(str, str, bool, str)
+
+    def __init__(self, action: str, vm_name: str, parent=None) -> None:
+        super().__init__(parent)
+        self.action = action
+        self.vm_name = vm_name
+
+    def run(self) -> None:
+        try:
+            from vm_harness.control.client import HubClient, HubError
+        except Exception as exc:
+            log.exception("Could not load the hub client for VM %s", self.vm_name)
+            self.completed.emit(self.action, self.vm_name, False, str(exc))
+            return
+
+        try:
+            hub = HubClient.connect(start=True, client_name="gui-dashboard")
+            hub.call(
+                f"vm.{self.action}",
+                {"name": self.vm_name, "backend": "qemu"},
+                timeout=45.0,
+            )
+        except HubError as exc:
+            self.completed.emit(self.action, self.vm_name, False, f"{exc.code}: {exc}")
+        except Exception as exc:
+            log.exception("Dashboard VM %s failed for %s", self.action, self.vm_name)
+            self.completed.emit(self.action, self.vm_name, False, str(exc))
+        else:
+            self.completed.emit(self.action, self.vm_name, True, "")
+
 
 class DashboardPanel(QWidget):
     """Main dashboard — VM status overview and quick actions."""
@@ -26,6 +61,8 @@ class DashboardPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._qmp_bridge = None
+        self._active_vm_name: str | None = None
+        self._vm_action_worker: _HubVMActionWorker | None = None
         self._vm_state = "unknown"
         self._vm_running = False
         self._vm_pid = "—"
@@ -61,9 +98,10 @@ class DashboardPanel(QWidget):
         state_layout.addWidget(state_label)
         self._state_label = state_label
 
-        vm_name_label = QLabel("omarchy-vm")
+        vm_name_label = QLabel("No VM selected")
         vm_name_label.setStyleSheet("color: " + T.TEXT_MUTED + "; font-size: 12px;")
         state_layout.addWidget(vm_name_label)
+        self._vm_name_label = vm_name_label
         state_layout.addStretch()
 
         status_row_layout.addLayout(state_layout)
@@ -169,6 +207,11 @@ class DashboardPanel(QWidget):
             bridge.connected.connect(self._on_connected)
             bridge.error.connect(self._on_error)
 
+    def set_active_vm(self, vm_name: str | None) -> None:
+        """Set the selected VM used by dashboard lifecycle actions."""
+        self._active_vm_name = vm_name
+        self._vm_name_label.setText(vm_name or "No VM selected")
+
     def _on_vm_status(self, status: dict):
         """Update dashboard with live VM status."""
         if not status:
@@ -226,34 +269,40 @@ class DashboardPanel(QWidget):
         pass
 
     def _on_start_vm(self):
-        """Start VM via REST API."""
-        import urllib.request
-        import json as _json
-        try:
-            req = urllib.request.Request(
-                "http://127.0.0.1:8443/api/v1/vms/test/start",
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = _json.loads(resp.read())
-                self.add_activity(f"VM start: {data.get('detail', 'ok')}")
-        except Exception as e:
-            self.add_activity(f"VM start failed: {e}")
+        """Start the selected VM through the authenticated hub."""
+        self._run_vm_action("start")
 
     def _on_stop_vm(self):
-        """Stop VM via REST API."""
-        import urllib.request
-        import json as _json
-        try:
-            req = urllib.request.Request(
-                "http://127.0.0.1:8443/api/v1/vms/test/stop",
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = _json.loads(resp.read())
-                self.add_activity(f"VM stop: {data.get('detail', 'ok')}")
-        except Exception as e:
-            self.add_activity(f"VM stop failed: {e}")
+        """Gracefully stop the selected VM through the authenticated hub."""
+        self._run_vm_action("stop")
+
+    def _run_vm_action(self, action: str) -> None:
+        if not self._active_vm_name:
+            self.add_activity(f"VM {action} failed: select a VM in VM Switcher first")
+            return
+        if self._vm_action_worker is not None and self._vm_action_worker.isRunning():
+            self.add_activity("VM action already in progress")
+            return
+
+        vm_name = self._active_vm_name
+        self.add_activity(f"VM {action} requested: {vm_name}")
+        worker = _HubVMActionWorker(action, vm_name, self)
+        worker.completed.connect(self._on_vm_action_completed)
+        worker.finished.connect(self._on_vm_action_worker_finished)
+        self._vm_action_worker = worker
+        worker.start()
+
+    def _on_vm_action_completed(self, action: str, vm_name: str, ok: bool, error: str) -> None:
+        if ok:
+            self.add_activity(f"VM {action}: {vm_name}")
+        else:
+            self.add_activity(f"VM {action} failed: {error}")
+
+    def _on_vm_action_worker_finished(self) -> None:
+        worker = self._vm_action_worker
+        self._vm_action_worker = None
+        if worker is not None:
+            worker.deleteLater()
 
     def _on_reset_vm(self):
         """Reset VM via QMP bridge (requires running VM)."""

@@ -7,8 +7,8 @@ from one of them is the same VM every other one sees, and every change lands in 
 ```
  window (PyQt5) ──attach──┐
  MCP server (stdio) ──────┤
- python -m vm_harness call┼──►  hub  127.0.0.1:8765  ──►  QEMU · VirtualBox · VMware · Hyper-V · WSL · KVM
- ABP / any HTTP client ───┘      (catalog, audit)         Docker · Podman · Kubernetes · Compose
+ CLI / ACP agent (stdio) ─┼──►  hub  127.0.0.1:8765  ──►  QEMU · VirtualBox · VMware · Hyper-V · WSL · KVM
+ ABP / HTTP / A2A clients ─┘      (catalog, audit)         Docker · Podman · Kubernetes · Compose
 ```
 
 ## Running it
@@ -17,6 +17,9 @@ from one of them is the same VM every other one sees, and every change lands in 
 python -m vm_harness serve          # the hub (the window and the MCP server start it if it is not running)
 python -m vm_harness gui            # the window; it attaches to the hub
 python -m vm_harness mcp            # MCP over stdio
+python -m vm_harness acp            # ACP agent over stdio
+python -m vm_harness a2a discover   # discover the local hub's Agent Card
+python -m vm_harness a2a send --operation vm.list
 python -m vm_harness status         # hub address, and whether the window is attached
 python -m vm_harness ops snapshot   # search the operations
 python -m vm_harness call vm.list
@@ -34,6 +37,28 @@ The hub writes `control.json` when it starts and removes it when it stops. Clien
 or copies a token. The token is generated once. `VMH_URL` + `VMH_TOKEN` point a client at another hub (for example
 one on another machine reached over an SSH tunnel). Requests carry `Authorization: Bearer <token>` (or `X-VMH-Token`).
 The hub listens on 127.0.0.1 unless `--host` says otherwise.
+
+## A2A and ACP
+
+The hub starts an A2A 1.0 JSON-RPC endpoint on loopback with an OS-assigned port. The public Agent Card is at
+`<a2a_url>/.well-known/agent-card.json`; task requests require the hub's bearer token. `a2a_url` is included in
+`control.json`, `/v1/health`, and `service.info`. Configure `--a2a-host`, `--a2a-port`, and `--a2a-url` to bind
+or advertise a different address; keep the A2A endpoint on a trusted network because authenticated calls can run
+mutating and destructive catalog operations.
+
+Send an operation as a JSON text message:
+
+```json
+{"operation":"vm.list","args":{}}
+```
+
+`vm-harness acp` runs a separate ACP v1 stdio agent. ACP clients can list operations with `/ops [query]`, invoke
+one with `/call <operation> [JSON args]`, or send the equivalent JSON object. Read-only operations run directly;
+mutating and destructive operations request one-time permission from the ACP client. The agent offers no
+“allow always” option and does not advertise filesystem or terminal access.
+
+The GUI's **Agent Protocols** panel is both an A2A client and an ACP stdio client. For ACP, it launches the
+configured executable and argument list as a child process; approval dialogs are deny-by-default.
 
 ## The catalog
 

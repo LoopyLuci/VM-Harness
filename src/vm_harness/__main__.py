@@ -2,6 +2,9 @@
 
     python -m vm_harness serve                     run the hub (the local API every client uses)
     python -m vm_harness mcp [--tools compact]     MCP server on stdio (starts the hub if needed)
+    python -m vm_harness acp                       ACP agent on stdio
+    python -m vm_harness a2a discover [url]        discover an A2A agent
+    python -m vm_harness a2a send [url] --operation vm.list
     python -m vm_harness gui                       open the window (it attaches to the hub)
     python -m vm_harness ops [query] [--group g]   list operations
     python -m vm_harness call vm.list               run one: arguments as key=value or --json '{...}'
@@ -95,6 +98,55 @@ def _stop() -> int:
         return 1
 
 
+def _a2a(argv: list[str]) -> int:
+    import argparse
+    import asyncio
+
+    parser = argparse.ArgumentParser(prog="vm-harness a2a")
+    commands = parser.add_subparsers(dest="action", required=True)
+    discover = commands.add_parser("discover", help="fetch an agent card")
+    discover.add_argument("url", nargs="?", help="A2A base URL; defaults to the local hub")
+    discover.add_argument("--token", default="", help="bearer token for the agent card")
+    send = commands.add_parser("send", help="send a message or structured operation")
+    send.add_argument("url", nargs="?", help="A2A base URL; defaults to the local hub")
+    send.add_argument("--token", default="", help="bearer token for the agent")
+    message = send.add_mutually_exclusive_group(required=True)
+    message.add_argument("--message", help="text to send to the remote agent")
+    message.add_argument("--operation", help="VM-Harness operation ID")
+    send.add_argument("--json", default="{}", help="JSON object of operation arguments")
+    args = parser.parse_args(argv)
+
+    from vm_harness.control.client import HubClient, HubError
+
+    try:
+        token = args.token
+        url = args.url
+        if not url:
+            hub = HubClient.connect(start=True, client_name="a2a-cli")
+            url = hub.health().get("a2a_url", "")
+            token = token or hub.token
+        if not url:
+            raise HubError("the hub did not publish an A2A endpoint", code="unavailable")
+
+        from vm_harness.protocols.a2a import discover_agent, send_agent_message
+
+        if args.action == "discover":
+            result = asyncio.run(discover_agent(url, token=token))
+        else:
+            text = args.message
+            if args.operation:
+                operation_args = json.loads(args.json)
+                if not isinstance(operation_args, dict):
+                    raise ValueError("--json must contain an object")
+                text = json.dumps({"operation": args.operation, "args": operation_args})
+            result = asyncio.run(send_agent_message(url, text, token=token))
+    except (HubError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(result, indent=2, default=str))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     cmd = argv[0] if argv else "help"
@@ -105,6 +157,11 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "mcp":
         from vm_harness.control.mcp_server import main as mcp
         return mcp(rest)
+    if cmd == "acp":
+        from vm_harness.protocols.acp import main as acp_main
+        return acp_main()
+    if cmd == "a2a":
+        return _a2a(rest)
     if cmd == "gui":
         os.chdir(_ROOT)
         from gui.__main__ import main as gui_main

@@ -188,6 +188,10 @@ def test_hub_writes_and_removes_its_discovery_file(fake_engine, isolated_home):
         hub = await _hub(engine)
         data = json.loads((isolated_home / "control.json").read_text())
         assert data["url"] == hub.url and data["token"] == "t" * 40
+        assert data["a2a_url"] == hub.a2a_url and hub.a2a_url.startswith("http://127.0.0.1:")
+        async with aiohttp.ClientSession() as session:
+            async with session.get(hub.url + "/v1/health") as response:
+                assert (await response.json())["a2a_url"] == hub.a2a_url
         await hub.stop()
         assert not (isolated_home / "control.json").exists()
 
@@ -301,3 +305,163 @@ def test_compact_mode_offers_three_tools():
     h = McpHandler([{"id": "vm.start", "group": "vm", "summary": "", "params": {}, "mutating": True}],
                    lambda o, a: None, mode="compact")
     assert [t["name"] for t in h.list_tools()] == ["vmh_operations", "vmh_describe", "vmh_call"]
+
+
+# ---- A2A and ACP -----------------------------------------------------------------------------------------------
+def test_a2a_card_authentication_and_operation_round_trip():
+    from vm_harness.protocols.a2a import A2AServer, discover_agent, send_operation
+
+    class FakeHub:
+        async def call(self, operation, args, client="local"):
+            return {"operation": operation, "args": args, "client": client}
+
+    async def run():
+        server = A2AServer(FakeHub(), "t" * 40)
+        await server.start()
+        try:
+            card = await discover_agent(server.url)
+            assert card["name"] == "VM-Harness"
+            assert card["securitySchemes"]["bearerAuth"]["httpAuthSecurityScheme"]["scheme"] == "bearer"
+            async with aiohttp.ClientSession() as session:
+                async with session.post(server.url + "/a2a/jsonrpc", json={}) as response:
+                    assert response.status == 401
+            events = await send_operation(server.url, "vm.list", {"limit": 1}, token="t" * 40)
+            task = events[0]["task"]
+            result = json.loads(task["artifacts"][0]["parts"][0]["text"])
+            assert task["status"]["state"] == "TASK_STATE_COMPLETED"
+            assert result["result"]["client"] == "a2a"
+        finally:
+            await server.stop()
+
+    asyncio.run(run())
+
+
+def test_acp_requires_one_time_permission_for_mutating_operations(monkeypatch):
+    from acp.schema import AllowedOutcome, DeniedOutcome, RequestPermissionResponse
+    import vm_harness.protocols.acp as acp
+
+    spec = {"id": "vm.start", "summary": "Start VM", "mutating": True, "destructive": False}
+    calls = []
+
+    class FakeConnection:
+        def __init__(self, outcome):
+            self.outcome = outcome
+            self.updates = []
+            self.options = []
+
+        async def session_update(self, session_id, update):
+            self.updates.append(update)
+
+        async def request_permission(self, session_id, tool_call, options):
+            self.options = options
+            return RequestPermissionResponse(outcome=self.outcome)
+
+    monkeypatch.setattr(acp, "_find_operation", lambda operation: spec)
+    monkeypatch.setattr(acp, "_call_operation", lambda operation, args: calls.append((operation, args)) or {"ok": True})
+
+    async def run():
+        denied_connection = FakeConnection(DeniedOutcome())
+        denied_agent = acp.VMHarnessACPAgent()
+        denied_agent.on_connect(denied_connection)
+        denied = await denied_agent._dispatch("session", "/call vm.start {\"name\":\"lab\"}")
+        assert "Permission denied" in denied
+        assert not calls
+        assert {option.kind for option in denied_connection.options} == {"allow_once", "reject_once"}
+        assert denied_connection.updates[-1].status == "failed"
+
+        allowed_connection = FakeConnection(AllowedOutcome(optionId="allow-once"))
+        allowed_agent = acp.VMHarnessACPAgent()
+        allowed_agent.on_connect(allowed_connection)
+        result = await allowed_agent._dispatch("session", "/call vm.start {\"name\":\"lab\"}")
+        assert calls == [("vm.start", {"name": "lab"})]
+        assert '"ok": true' in result
+        assert allowed_connection.updates[-1].status == "completed"
+
+    asyncio.run(run())
+
+
+def test_acp_operation_request_validation():
+    from vm_harness.protocols.acp import _parse_call
+
+    assert _parse_call('/call vm.list {"limit":1}') == ("vm.list", {"limit": 1})
+    assert _parse_call('{"operation":"vm.list"}') == ("vm.list", {})
+    with pytest.raises(ValueError, match="JSON object"):
+        _parse_call("/call vm.start []")
+
+
+def test_acp_stdio_handshake_session_and_help_round_trip():
+    import os
+    import sys
+    from pathlib import Path
+
+    from acp import PROTOCOL_VERSION, spawn_agent_process
+    from acp.schema import AgentMessageChunk, Implementation, TextContentBlock
+
+    root = Path(__file__).resolve().parents[1]
+    updates = []
+
+    class Client:
+        async def session_update(self, session_id, update, **kwargs):
+            if isinstance(update, AgentMessageChunk) and isinstance(update.content, TextContentBlock):
+                updates.append(update.content.text)
+
+        async def request_permission(self, session_id, tool_call, options, **kwargs):
+            from acp.schema import DeniedOutcome, RequestPermissionResponse
+
+            return RequestPermissionResponse(outcome=DeniedOutcome())
+
+    async def run():
+        env = dict(os.environ)
+        paths = [str(root / "src"), str(root)]
+        if env.get("PYTHONPATH"):
+            paths.append(env["PYTHONPATH"])
+        env["PYTHONPATH"] = os.pathsep.join(paths)
+        async with spawn_agent_process(
+            Client(),
+            sys.executable,
+            "-m",
+            "vm_harness",
+            "acp",
+            cwd=root,
+            env=env,
+        ) as (connection, _process):
+            initialized = await connection.initialize(
+                protocol_version=PROTOCOL_VERSION,
+                client_info=Implementation(name="test", version="1"),
+            )
+            session = await connection.new_session(cwd=str(root))
+            response = await connection.prompt(
+                session_id=session.sessionId,
+                prompt=[TextContentBlock(text="/help")],
+            )
+            assert initialized.protocolVersion == PROTOCOL_VERSION
+            assert response.stopReason == "end_turn"
+
+    asyncio.run(run())
+    assert any("VM-Harness ACP commands" in update for update in updates)
+
+
+def test_a2a_cli_uses_local_hub_credentials_and_structured_arguments(monkeypatch, capsys):
+    import vm_harness.__main__ as cli
+    import vm_harness.protocols.a2a as a2a
+    from vm_harness.control.client import HubClient
+
+    calls = []
+
+    class FakeHub:
+        token = "local-token"
+
+        def health(self):
+            return {"a2a_url": "http://127.0.0.1:1234"}
+
+    async def send(base_url, text, token=""):
+        calls.append((base_url, json.loads(text), token))
+        return [{"ok": True}]
+
+    monkeypatch.setattr(HubClient, "connect", classmethod(lambda cls, **kwargs: FakeHub()))
+    monkeypatch.setattr(a2a, "send_agent_message", send)
+    assert cli._a2a(["send", "--operation", "vm.list", "--json", '{"limit":1}']) == 0
+    assert calls == [
+        ("http://127.0.0.1:1234", {"operation": "vm.list", "args": {"limit": 1}}, "local-token")
+    ]
+    assert json.loads(capsys.readouterr().out) == [{"ok": True}]

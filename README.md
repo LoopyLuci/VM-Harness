@@ -17,10 +17,11 @@ operations, MCP, and driving the window remotely.
 
 ## Features
 
-- **34 GUI Panels** — Complete VM control from a polished dark-themed desktop interface
+- **35 GUI Panels** — Complete VM control from a polished dark-themed desktop interface
 - **Command line** — every operation from the shell, over the same hub as the window and the MCP server
 - **REST API** — HTTP endpoints for programmatic control
 - **MCP Server** — every operation as an MCP tool, including driving the window (`python -m vm_harness mcp`)
+- **A2A and ACP** — authenticated A2A server in the hub, A2A client discovery/messaging, and an ACP stdio agent/client
 - **Self-Healing** — Atomic state, process guardian, automatic recovery
 - **Multi-VM** — Control multiple QEMU instances from one interface
 - **ISO Manager** — Internal storage + external folder scanning + downloads
@@ -53,6 +54,7 @@ operations, MCP, and driving the window remotely.
 | 21 | **Security** | Credential vault, user management, audit log |
 | 22 | **Troubleshooting** | Diagnostics, GDB debugger, debug logs |
 | 23 | **Logs** | Filterable, searchable, exportable log viewer |
+| 24 | **Agent Protocols** | A2A discovery/messaging and ACP stdio agent connections |
 
 ## Self-Healing System
 
@@ -71,6 +73,9 @@ vm-harness serve                   # run the hub (the local API every client use
 vm-harness stop                    # stop the hub
 vm-harness gui                     # open the window (it attaches to the hub)
 vm-harness mcp                     # MCP server on stdio
+vm-harness acp                     # ACP agent on stdio (mutations require client approval)
+vm-harness a2a discover            # discover the local hub's Agent Card
+vm-harness a2a send --operation vm.list
 vm-harness ops [query]             # list operations, or search them
 vm-harness ops --group vm          # just one group
 vm-harness call vm.list            # run one operation
@@ -80,6 +85,12 @@ vm-harness call vm.start name=Kali # arguments as key=value, or --json '{...}'
 The `vm.*`, `iso.*`, `container.*` and `host.*` names are operation IDs, not subcommands: `vm.list`,
 `vm.start`, `vm.stop`, `vm.snapshot.create`, `iso.list`, `container.list`, `host.capabilities`, and about 160 more.
 `vm-harness ops` lists them all with a summary; `docs/control.md` documents them.
+
+The hub also serves an authenticated A2A endpoint. Its URL is available from `vm-harness call service.info`
+and `~/.vmharness/control.json` (`a2a_url`); it defaults to loopback on an OS-assigned port. Use the GUI's
+**Agent Protocols** panel to discover and message A2A agents, or launch a local ACP stdio agent. ACP operation
+requests use `/ops`, `/call <operation> [JSON args]`, or a JSON object; every mutating operation requires an
+explicit one-time approval from the ACP client.
 
 ## Talking to a guest
 

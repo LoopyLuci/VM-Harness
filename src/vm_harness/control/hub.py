@@ -125,8 +125,12 @@ class GuiLink:
 
 class Hub:
     def __init__(self, *, host: str = "127.0.0.1", port: int = DEFAULT_PORT, engine: Optional[Engine] = None,
-                 token: Optional[str] = None, write_discovery: bool = True) -> None:
+                 token: Optional[str] = None, write_discovery: bool = True, a2a_host: str = "127.0.0.1",
+                 a2a_port: int = 0, a2a_advertised_url: str = "") -> None:
         self.host, self.port = host, port
+        self.a2a_host, self.a2a_port = a2a_host, a2a_port
+        self.a2a_advertised_url = a2a_advertised_url
+        self.a2a_url = ""
         self.engine = engine or Engine()
         self.audit = AuditLog(home() / "audit")
         self.catalog: Catalog = build_catalog(self.engine, self.audit)
@@ -136,6 +140,7 @@ class Hub:
         self.started = time.time()
         self.write_discovery = write_discovery
         self._runner: Optional[web.AppRunner] = None
+        self._a2a_server: Any = None
         self._stop = asyncio.Event()
         self._mcp_handler: Any = None
         self._add_service_ops()
@@ -149,7 +154,7 @@ class Hub:
         async def info() -> dict:
             """The hub: version, pid, uptime, address, whether the window is attached, operation counts"""
             return {"version": VERSION, "pid": os.getpid(), "uptime_s": round(time.time() - self.started),
-                    "url": self.url, "gui_attached": self.gui.attached, "gui": self.gui.info,
+                    "url": self.url, "a2a_url": self.a2a_url, "gui_attached": self.gui.attached, "gui": self.gui.info,
                     "operations": len(cat.ids()), "groups": cat.groups(), "home": str(home())}
 
         @cat.op("service.operations", group="service")
@@ -274,7 +279,7 @@ class Hub:
 
     async def _health(self, _r: web.Request) -> web.Response:
         return web.json_response({"ok": True, "service": "vm-harness", "version": VERSION, "pid": os.getpid(),
-                                  "gui": self.gui.attached})
+                                  "gui": self.gui.attached, "a2a_url": self.a2a_url})
 
     async def _operations(self, r: web.Request) -> web.Response:
         ops = self.catalog.search(r.query.get("q", ""), r.query.get("group", ""))
@@ -385,7 +390,7 @@ class Hub:
         if not self.write_discovery:
             return
         data = {"url": self.url, "token": self.token, "pid": os.getpid(), "version": VERSION,
-                "started": self.started, "gui": self.gui.attached}
+                "started": self.started, "gui": self.gui.attached, "a2a_url": self.a2a_url}
         tmp = discovery_path().with_suffix(".tmp")
         tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
         try:
@@ -401,16 +406,41 @@ class Hub:
         await site.start()
         if self.port == 0:
             self.port = site._server.sockets[0].getsockname()[1]  # type: ignore[union-attr]
+        from vm_harness.protocols.a2a import A2AServer
+
+        self._a2a_server = A2AServer(
+            self,
+            self.token,
+            host=self.a2a_host,
+            port=self.a2a_port,
+            advertised_url=self.a2a_advertised_url,
+            version=VERSION,
+        )
+        try:
+            await self._a2a_server.start()
+        except Exception:
+            await self._runner.cleanup()
+            self._runner = None
+            self._a2a_server = None
+            raise
+        self.a2a_port = self._a2a_server.port
+        self.a2a_url = self._a2a_server.url
         self._write_discovery()
-        log.info("VM-Harness hub on %s (%d operations)", self.url, len(self.catalog.ids()))
+        log.info("VM-Harness hub on %s; A2A on %s (%d operations)", self.url, self.a2a_url,
+                 len(self.catalog.ids()))
 
     async def stop(self) -> None:
         for ws in list(self.subscribers):
             await ws.close()
         if self.gui.ws is not None:
             await self.gui.ws.close()
+        if self._a2a_server is not None:
+            await self._a2a_server.stop()
+            self._a2a_server = None
+            self.a2a_url = ""
         if self._runner:
             await self._runner.cleanup()
+            self._runner = None
         await self.engine.close()
         d = read_discovery()
         if self.write_discovery and d and d.get("pid") == os.getpid():
@@ -452,6 +482,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(prog="vm-harness serve")
     ap.add_argument("--host", default=os.environ.get("VMH_HOST", "127.0.0.1"))
     ap.add_argument("--port", type=int, default=int(os.environ.get("VMH_PORT", DEFAULT_PORT)))
+    ap.add_argument("--a2a-host", default=os.environ.get("VMH_A2A_HOST", "127.0.0.1"))
+    ap.add_argument("--a2a-port", type=int, default=int(os.environ.get("VMH_A2A_PORT", 0)))
+    ap.add_argument("--a2a-url", default=os.environ.get("VMH_A2A_ADVERTISED_URL", ""))
     ap.add_argument("--log-level", default="INFO")
     a = ap.parse_args(argv)
     logging.basicConfig(level=a.log_level.upper(), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -459,7 +492,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     if existing:
         print(f"a VM-Harness hub is already running at {existing['url']} (pid {existing['pid']})")
         return 0
-    hub = Hub(host=a.host, port=a.port)
+    hub = Hub(host=a.host, port=a.port, a2a_host=a.a2a_host, a2a_port=a.a2a_port,
+              a2a_advertised_url=a.a2a_url)
     try:
         asyncio.run(hub.serve_forever())
     except KeyboardInterrupt:

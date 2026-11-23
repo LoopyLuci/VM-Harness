@@ -201,6 +201,7 @@ class Sidebar(QWidget):
         ("Troubleshoot", "🔍", "troubleshoot"),
         ("Logs", "📜", "logs"),
         ("AI Chat", "💬", "chat"),
+        ("Agent Protocols", "🔌", "agent_protocols"),
         ("AI Providers", "🤖", "providers"),
         ("Pairing", "🔗", "pairing"),
     ]
@@ -592,6 +593,9 @@ class MainWindow(QMainWindow):
         orphaned loops starve the event queue and every later GUI test times
         out waiting for a timer.
         """
+        protocols = getattr(self, "panels", {}).get("agent_protocols")
+        if protocols is not None:
+            protocols.shutdown()
         for name in ("qmp_bridge", "ssh_bridge"):
             bridge = getattr(self, name, None)
             if bridge is None:
@@ -673,6 +677,7 @@ class MainWindow(QMainWindow):
         from gui.panels_automation import AutomationPanel
         from gui.panels_troubleshoot import TroubleshootPanel
         from gui.panels_chat import ChatPanel
+        from gui.panels_agent_protocols import AgentProtocolsPanel
         from gui.panels_providers import AIProvidersPanel
         from gui.panels_settings import SettingsPanel
         from gui.panels_pairing import PairingPanel
@@ -709,6 +714,7 @@ class MainWindow(QMainWindow):
             (AutomationPanel, "automation"),
             (TroubleshootPanel, "troubleshoot"),
             (ChatPanel, "chat"),
+            (AgentProtocolsPanel, "agent_protocols"),
             (AIProvidersPanel, "providers"),
             (MonitoringPanel, "monitoring"),
             (SettingsPanel, "settings"),
@@ -741,8 +747,10 @@ class MainWindow(QMainWindow):
             # signals were emitted but never connected, so nothing on screen
             # ever followed the selection.
             self.panels["vm_switcher"].vm_changed.connect(self._on_active_vm_changed)
-            self.panels["vm_switcher"].vm_added.connect(self._on_active_vm_changed)
-            self.panels["vm_switcher"].vm_removed.connect(self._on_active_vm_changed)
+            self.panels["vm_switcher"].vm_removed.connect(self._on_vm_removed)
+            self.panels["dashboard"].set_active_vm(
+                self.panels["vm_switcher"].get_active_vm()
+            )
         if "vm_control" in self.panels:
             self.panels["vm_control"].set_manager(self.vm_manager)
             # Deliberately not set_multi_qmp_bridge(self.qmp_bridge): qmp_bridge
@@ -773,10 +781,20 @@ class MainWindow(QMainWindow):
         window opened, which was none.
         """
         self.active_vm_name = vm_name
+        dashboard = self.panels.get("dashboard")
+        if dashboard is not None:
+            dashboard.set_active_vm(vm_name)
         for panel_name in ("vm_control", "vm_console", "guest_terminal"):
             panel = self.panels.get(panel_name)
             if panel is not None and hasattr(panel, "switch_to_vm"):
                 panel.switch_to_vm(vm_name)
+
+    def _on_vm_removed(self, vm_name: str) -> None:
+        if self.active_vm_name == vm_name:
+            self.active_vm_name = None
+            dashboard = self.panels.get("dashboard")
+            if dashboard is not None:
+                dashboard.set_active_vm(None)
 
     def _switch_panel(self, name: str):
         if name in self.panels:

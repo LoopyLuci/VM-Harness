@@ -94,6 +94,44 @@ class TestPanels:
         assert panel.activity_list is not None
         qtbot.addWidget(panel)
 
+    @pytest.mark.parametrize("action", ["start", "stop"])
+    def test_dashboard_vm_action_targets_selected_vm(self, qtbot, app, monkeypatch, action):
+        from gui.panels import DashboardPanel, _HubVMActionWorker
+        from vm_harness.control.client import HubClient
+
+        calls = []
+
+        class FakeHub:
+            def call(self, operation, args, /, timeout):
+                calls.append((operation, args, timeout))
+
+        monkeypatch.setattr(
+            HubClient,
+            "connect",
+            classmethod(lambda cls, **kwargs: FakeHub()),
+        )
+        monkeypatch.setattr(_HubVMActionWorker, "start", lambda worker: worker.run())
+        panel = DashboardPanel()
+        qtbot.addWidget(panel)
+        panel.set_active_vm("omarchy")
+
+        getattr(panel, f"_on_{action}_vm")()
+
+        assert calls == [
+            (f"vm.{action}", {"name": "omarchy", "backend": "qemu"}, 45.0)
+        ]
+        assert "VM " + action + ": omarchy" in panel.activity_list.item(0).text()
+
+    def test_dashboard_start_requires_selected_vm(self, qtbot, app):
+        from gui.panels import DashboardPanel
+
+        panel = DashboardPanel()
+        qtbot.addWidget(panel)
+
+        panel._on_start_vm()
+
+        assert "select a VM" in panel.activity_list.item(0).text()
+
     def test_vm_control_panel(self, qtbot, app):
         from gui.panels_vm_control import VMControlPanel
 
@@ -328,7 +366,7 @@ class TestMainWindow:
         assert win is not None
         assert win.width() == 1400
         assert win.height() == 900
-        assert len(win.panels) == 34
+        assert len(win.panels) == 35
         assert win.qmp_bridge is not None
         assert win.ssh_bridge is not None
         qtbot.addWidget(win)
