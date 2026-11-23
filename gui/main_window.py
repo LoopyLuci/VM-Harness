@@ -748,6 +748,7 @@ class MainWindow(QMainWindow):
             # ever followed the selection.
             self.panels["vm_switcher"].vm_changed.connect(self._on_active_vm_changed)
             self.panels["vm_switcher"].vm_removed.connect(self._on_vm_removed)
+            self.panels["dashboard"].set_vm_manager(self.vm_manager)
             self.panels["dashboard"].set_active_vm(
                 self.panels["vm_switcher"].get_active_vm()
             )

@@ -7,7 +7,7 @@ quick action buttons, and recent activity log.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from gui.theme import T
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
@@ -20,39 +20,40 @@ from PyQt5.QtWidgets import (
 from gui.widgets import Card, StatusIndicator
 from gui.qmp_extractor import QMPExtractor
 
+if TYPE_CHECKING:
+    from gui.multi_vm import MultiVMManager
+
 log = logging.getLogger("vmharness.gui.dashboard")
 
 
-class _HubVMActionWorker(QThread):
+class _VMActionWorker(QThread):
     completed = pyqtSignal(str, str, bool, str)
 
-    def __init__(self, action: str, vm_name: str, parent=None) -> None:
+    def __init__(
+        self,
+        action: str,
+        vm_name: str,
+        manager: MultiVMManager,
+        parent=None,
+    ) -> None:
         super().__init__(parent)
         self.action = action
         self.vm_name = vm_name
+        self.manager = manager
 
     def run(self) -> None:
         try:
-            from vm_harness.control.client import HubClient, HubError
-        except Exception as exc:
-            log.exception("Could not load the hub client for VM %s", self.vm_name)
-            self.completed.emit(self.action, self.vm_name, False, str(exc))
-            return
-
-        try:
-            hub = HubClient.connect(start=True, client_name="gui-dashboard")
-            hub.call(
-                f"vm.{self.action}",
-                {"name": self.vm_name, "backend": "qemu"},
-                timeout=45.0,
-            )
-        except HubError as exc:
-            self.completed.emit(self.action, self.vm_name, False, f"{exc.code}: {exc}")
+            if self.action == "start":
+                ok, message = self.manager.start_vm(self.vm_name)
+            elif self.action == "stop":
+                ok, message = self.manager.stop_vm(self.vm_name)
+            else:
+                raise ValueError(f"unsupported VM action: {self.action}")
         except Exception as exc:
             log.exception("Dashboard VM %s failed for %s", self.action, self.vm_name)
             self.completed.emit(self.action, self.vm_name, False, str(exc))
         else:
-            self.completed.emit(self.action, self.vm_name, True, "")
+            self.completed.emit(self.action, self.vm_name, ok, message)
 
 
 class DashboardPanel(QWidget):
@@ -61,8 +62,9 @@ class DashboardPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._qmp_bridge = None
+        self._vm_manager: MultiVMManager | None = None
         self._active_vm_name: str | None = None
-        self._vm_action_worker: _HubVMActionWorker | None = None
+        self._vm_action_worker: _VMActionWorker | None = None
         self._vm_state = "unknown"
         self._vm_running = False
         self._vm_pid = "—"
@@ -207,6 +209,10 @@ class DashboardPanel(QWidget):
             bridge.connected.connect(self._on_connected)
             bridge.error.connect(self._on_error)
 
+    def set_vm_manager(self, manager: MultiVMManager) -> None:
+        """Use the window's shared VM manager for lifecycle actions."""
+        self._vm_manager = manager
+
     def set_active_vm(self, vm_name: str | None) -> None:
         """Set the selected VM used by dashboard lifecycle actions."""
         self._active_vm_name = vm_name
@@ -280,23 +286,26 @@ class DashboardPanel(QWidget):
         if not self._active_vm_name:
             self.add_activity(f"VM {action} failed: select a VM in VM Switcher first")
             return
+        if self._vm_manager is None:
+            self.add_activity(f"VM {action} failed: VM manager is unavailable")
+            return
         if self._vm_action_worker is not None and self._vm_action_worker.isRunning():
             self.add_activity("VM action already in progress")
             return
 
         vm_name = self._active_vm_name
         self.add_activity(f"VM {action} requested: {vm_name}")
-        worker = _HubVMActionWorker(action, vm_name, self)
+        worker = _VMActionWorker(action, vm_name, self._vm_manager, self)
         worker.completed.connect(self._on_vm_action_completed)
         worker.finished.connect(self._on_vm_action_worker_finished)
         self._vm_action_worker = worker
         worker.start()
 
-    def _on_vm_action_completed(self, action: str, vm_name: str, ok: bool, error: str) -> None:
+    def _on_vm_action_completed(self, action: str, vm_name: str, ok: bool, message: str) -> None:
         if ok:
-            self.add_activity(f"VM {action}: {vm_name}")
+            self.add_activity(message or f"VM {action}: {vm_name}")
         else:
-            self.add_activity(f"VM {action} failed: {error}")
+            self.add_activity(f"VM {action} failed for {vm_name}: {message}")
 
     def _on_vm_action_worker_finished(self) -> None:
         worker = self._vm_action_worker

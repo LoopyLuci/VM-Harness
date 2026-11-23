@@ -96,31 +96,41 @@ class TestPanels:
 
     @pytest.mark.parametrize("action", ["start", "stop"])
     def test_dashboard_vm_action_targets_selected_vm(self, qtbot, app, monkeypatch, action):
-        from gui.panels import DashboardPanel, _HubVMActionWorker
-        from vm_harness.control.client import HubClient
+        from gui.panels import DashboardPanel, _VMActionWorker
 
         calls = []
 
-        class FakeHub:
-            def call(self, operation, args, /, timeout):
-                calls.append((operation, args, timeout))
+        class FakeManager:
+            def start_vm(self, name):
+                calls.append(("start", name))
+                return True, f"VM '{name}' started"
 
-        monkeypatch.setattr(
-            HubClient,
-            "connect",
-            classmethod(lambda cls, **kwargs: FakeHub()),
-        )
-        monkeypatch.setattr(_HubVMActionWorker, "start", lambda worker: worker.run())
+            def stop_vm(self, name):
+                calls.append(("stop", name))
+                return True, f"VM '{name}' stopped"
+
+        monkeypatch.setattr(_VMActionWorker, "start", lambda worker: worker.run())
         panel = DashboardPanel()
         qtbot.addWidget(panel)
+        panel.set_vm_manager(FakeManager())
         panel.set_active_vm("omarchy")
 
         getattr(panel, f"_on_{action}_vm")()
 
-        assert calls == [
-            (f"vm.{action}", {"name": "omarchy", "backend": "qemu"}, 45.0)
-        ]
-        assert "VM " + action + ": omarchy" in panel.activity_list.item(0).text()
+        assert calls == [(action, "omarchy")]
+        expected_status = "started" if action == "start" else "stopped"
+        assert f"VM 'omarchy' {expected_status}" in panel.activity_list.item(0).text()
+
+    def test_dashboard_vm_action_requires_manager(self, qtbot, app):
+        from gui.panels import DashboardPanel
+
+        panel = DashboardPanel()
+        qtbot.addWidget(panel)
+        panel.set_active_vm("omarchy")
+
+        panel._on_start_vm()
+
+        assert "VM manager is unavailable" in panel.activity_list.item(0).text()
 
     def test_dashboard_start_requires_selected_vm(self, qtbot, app):
         from gui.panels import DashboardPanel
@@ -367,6 +377,7 @@ class TestMainWindow:
         assert win.width() == 1400
         assert win.height() == 900
         assert len(win.panels) == 35
+        assert win.panels["dashboard"]._vm_manager is win.vm_manager
         assert win.qmp_bridge is not None
         assert win.ssh_bridge is not None
         qtbot.addWidget(win)
